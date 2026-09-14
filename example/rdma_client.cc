@@ -2,64 +2,98 @@
 #include "rdma_hnsw/runtime/compute_node.h"
 #include <atomic>
 #include <iostream>
-#include <mutex>
+#include <latch>
+#include <syncstream>
 #include <thread>
 #include <vector>
 
 using namespace rdma_hnsw;
-static UpdateRequest up(NodeId id, const Vector &v) {
-  return {update_op::Upsert, id, v};
-}
 
 int main(int argc, char **argv) {
-  if (argc < 3 || argc > 5) {
-    std::cerr << "usage: rdma_client <host> <port> [device] [ib-port]\n";
-    return 2;
+  try {
+    if (argc < 3 || argc > 7) {
+      std::cerr << "usage: rdma_client <host> <port> [device] [device-port] "
+                   "[ib|cm] [timeout-ms]\n";
+      return 2;
+    }
+    ComputeNodeConfig config;
+    config.transport = TransportKind::Rdma;
+    config.host = argv[1];
+    config.port = std::stoul(argv[2]);
+    config.ib_device = argc >= 4 ? argv[3] : "";
+    config.ib_port = argc >= 5 ? std::stoul(argv[4]) : 1;
+    const std::string connection = argc >= 6 ? argv[5] : "ib";
+    if (connection != "ib" && connection != "cm")
+      throw std::invalid_argument("connection must be ib or cm");
+    config.rdma_connection =
+        connection == "cm" ? RdmaConnection::Cm : RdmaConnection::Ib;
+    config.rdma_timeout_ms = argc >= 7 ? std::stoul(argv[6]) : 10000;
+    std::vector<Vector> queries;
+    std::size_t nodes;
+    {
+      ComputeNode node(config);
+      nodes = node.query_engine().catalog().header.node_count;
+      if (!nodes)
+        throw std::runtime_error("example requires a nonempty index");
+      queries =
+          generate_vectors(20, node.query_engine().catalog().header.dim, 7);
+      auto result = node.query_batch(queries);
+      auto update = node.update({update_op::Upsert, 0, queries[0]});
+      if (!update.ok)
+        throw std::runtime_error("initial update failed: " + update.error);
+      std::cout << "query: count=" << result.queries
+                << " elapsed_ms=" << result.elapsed_ms
+                << "\nupdate: ok=1 generation=" << update.generation << '\n';
+    }
+    // Application-owned scheduling: every thread owns an independent node/QP.
+    std::atomic<unsigned> failed{0}, updates{0};
+    std::atomic<std::uint64_t> reads{0}, writes{0};
+    std::latch start(1);
+    std::vector<std::jthread> workers;
+    auto workload = [&](int worker_id) {
+      start.wait();
+      try {
+        ComputeNode node(config);
+        if (worker_id < 4) {
+          auto result = node.query_batch(queries);
+          std::osyncstream(std::cout) << "concurrent query thread=" << worker_id
+                                      << " count=" << result.queries << '\n';
+        } else {
+          for (unsigned i = 1; i <= 5; ++i) {
+            auto result =
+                node.update({update_op::Upsert, static_cast<NodeId>(i % nodes),
+                             queries[i]});
+            if (!result.ok)
+              throw std::runtime_error("update " + std::to_string(i) + ": " +
+                                       result.error);
+            ++updates;
+          }
+        }
+        reads += node.transport().stats().read_ops.load();
+        writes += node.transport().stats().write_ops.load();
+      } catch (const std::exception &e) {
+        ++failed;
+        std::osyncstream(std::cerr)
+            << "worker " << worker_id << " failed: " << e.what() << '\n';
+      }
+    };
+    try {
+      for (int t = 0; t < 5; ++t)
+        workers.emplace_back(workload, t);
+    } catch (...) {
+      start.count_down();
+      throw;
+    }
+    start.count_down();
+    for (auto &worker : workers)
+      worker.join();
+    std::cout << "concurrent_updates_completed=" << updates
+              << " workers_failed=" << failed
+              << "\nconcurrent_rdma_read_ops=" << reads
+              << " concurrent_rdma_write_ops=" << writes << '\n';
+    return failed ? 1 : 0;
+  } catch (const std::exception &e) {
+    std::cerr << "rdma_client: " << e.what() << '\n';
+    return 1;
   }
-  const std::string device = argc >= 4 ? argv[3] : "mlx5_0";
-  const auto ib_port =
-      argc == 5 ? static_cast<std::size_t>(std::stoul(argv[4])) : 1;
-  ComputeNode node({"", TransportKind::Rdma, argv[1],
-                    static_cast<std::size_t>(std::stoul(argv[2])), device,
-                    ib_port, ReadPolicy::Fixed, DistanceKind::L2, 64, 10, 4,
-                    1000});
-  const auto dim = node.query_engine().catalog().header.dim;
-  auto q = generate_vectors(20, dim, 7);
-  auto before = node.query_batch(q);
-  auto u = node.update(up(0, q[0]));
-  std::cout << "query: count=" << before.queries
-            << " elapsed_ms=" << before.elapsed_ms << "\nupdate: ok=" << u.ok
-            << " generation=" << u.generation << '\n';
-
-  std::vector<std::thread> readers;
-  std::atomic<std::uint64_t> total_read_ops{0}, total_write_ops{0};
-  std::mutex output_mutex;
-  for (int t = 0; t < 4; ++t)
-    readers.emplace_back([&, t] {
-      ComputeNode worker({"", TransportKind::Rdma, argv[1],
-                          static_cast<std::size_t>(std::stoul(argv[2])), device,
-                          ib_port, ReadPolicy::Fixed, DistanceKind::L2, 64, 10,
-                          4, 1000});
-      const auto result = worker.query_batch(q);
-      total_read_ops.fetch_add(worker.transport().stats().read_ops.load());
-      std::lock_guard lock(output_mutex);
-      std::cout << "concurrent query thread=" << t
-                << " count=" << result.queries << '\n';
-    });
-  std::thread writer([&] {
-    ComputeNode updater({"", TransportKind::Rdma, argv[1],
-                         static_cast<std::size_t>(std::stoul(argv[2])), device,
-                         ib_port, ReadPolicy::Fixed, DistanceKind::L2, 64, 10,
-                         4, 1000});
-    for (NodeId i = 1; i < 6; ++i)
-      updater.update(up(i, q[i]));
-    total_write_ops.fetch_add(updater.transport().stats().write_ops.load());
-  });
-  for (auto &thread : readers)
-    thread.join();
-  writer.join();
-  std::cout << "concurrent query/update: independent ComputeNode per "
-               "thread\nrdma_read_ops="
-            << total_read_ops.load()
-            << " rdma_write_ops=" << total_write_ops.load() << '\n';
 }

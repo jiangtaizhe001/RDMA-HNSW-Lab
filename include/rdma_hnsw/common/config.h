@@ -40,6 +40,8 @@ struct Config {
   bool generate = false;
   bool help = false;
   bool verbose = false;
+  RdmaConnection rdma_connection = RdmaConnection::Ib;
+  std::size_t rdma_timeout_ms = 10000;
 };
 
 Config parse_config(int argc, char **argv, const std::string &mode);

@@ -511,7 +511,9 @@ void serve_rdma_session(int socket, const std::string &index_path,
     }
   }
 
-  ::close(socket);
+  // The accept worker owns this descriptor and closes it exactly once, after
+  // session resources are destroyed. Closing here as well can close a reused
+  // descriptor belonging to a newly accepted client.
 }
 
 int run_rdma_server(const std::string &bind, std::size_t port,

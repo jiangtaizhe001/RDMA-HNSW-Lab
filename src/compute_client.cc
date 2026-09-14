@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
       catalog = rdma_hnsw::GraphStore::load_catalog(c.index);
     rdma_hnsw::ComputeNode node(
         {c.index, c.transport, c.host, c.port, c.ib_device, c.ib_port, c.policy,
-         c.distance, c.ef_search, c.k, c.prefix_granularity, c.cache_capacity});
+         c.distance, c.ef_search, c.k, c.prefix_granularity, c.cache_capacity, c.rdma_connection, c.rdma_timeout_ms});
     // RDMA mode obtains the dimension and offset table during connection.
     catalog = node.query_engine().catalog();
     const auto queries =

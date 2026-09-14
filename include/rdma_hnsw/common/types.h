@@ -19,6 +19,7 @@ struct RemoteAddress {
 };
 
 enum class TransportKind { Mmap, Rdma };
+enum class RdmaConnection { Ib, Cm };
 enum class DistanceKind { L2, InnerProduct };
 enum class ReadPolicy { Fixed, HeaderActual, CachedLength, Prefix };
 

@@ -24,7 +24,8 @@ int main() {
   ReadContext ctx{*t, &m, 4, 100, {}};
   auto r = s->read(v, ctx);
   assert(r.ok && r.neighbors.size() == 2);
-  assert(m.wasted_bytes == 4 * sizeof(NodeId));
+  // Layer zero reserves 2*M=8 slots, of which this record uses two.
+  assert(m.wasted_bytes == 6 * sizeof(NodeId));
   std::remove(path);
   return 0;
 }

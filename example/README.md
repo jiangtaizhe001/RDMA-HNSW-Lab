@@ -6,9 +6,9 @@
 
 ```bash
 cd /home/xjs/lesson/RDMA-HNSW-lab
-cmake -S . -B build -DENABLE_RDMA=ON
+cmake -S . -B build -DENABLE_RDMA=ON -DENABLE_RDMA_CM=ON
 cmake --build build -j
-cmake -S example -B example/build -DENABLE_RDMA=ON
+cmake -S example -B example/build -DENABLE_RDMA=ON -DENABLE_RDMA_CM=ON
 cmake --build example/build -j
 ```
 
@@ -48,12 +48,32 @@ cmake --build example/build -j
 ./example/build/rdma_client 10.0.0.8 18515 mlx5_0 1
 ```
 
-参数依次为存储节点地址、TCP 控制端口、RDMA 设备名和 RDMA 端口号。
+参数依次为存储节点地址、服务端口、RDMA 设备名、设备端口号、连接后端（可选 `ib`/`cm`，默认 `ib`）和 CM 超时时间（可选，默认 10000 ms）。
+
+## eRDMA / librdmacm 示例
+
+两端编译时启用 `ENABLE_RDMA=ON` 和 `ENABLE_RDMA_CM=ON`。存储实例准备好索引后，修改 [storage-erdma.env](configs/storage-erdma.env) 中的本机 ERI IP、设备和索引路径；计算实例修改 [compute-erdma.env](configs/compute-erdma.env) 中的存储实例 ERI IP 和本机设备。以下命令从项目根目录执行：
+
+```bash
+# 存储实例
+./example/run_storage.sh example/configs/storage-erdma.env
+
+# 计算实例
+./example/run_compute.sh example/configs/compute-erdma.env
+```
+
+在 `example/` 目录执行时，分别使用 `./run_storage.sh configs/storage-erdma.env` 和 `./run_compute.sh configs/compute-erdma.env`。不传配置文件参数仍使用原来的 IB 模式。
+
+CM 模式仍运行本目录的 `rdma_client`，通过链接库创建 `ComputeNode`，不需要计算节点本地索引。示例执行 20 次查询、一次 upsert，以及 4 个查询线程和 1 个更新线程并发；并发阶段更新线程执行 5 次 upsert。每个线程独立拥有 `ComputeNode`，错误会导致非零退出码。示例会修改索引，应使用测试数据。
+
+存储端按会话提供不可变快照：其他客户端的更新需要 `reload()` 或重连才对当前读客户端可见。环境检查、最小自定义客户端、并发和缓存语义、集成测试见 [eRDMA 使用说明](../docs/erdma.md)。
 
 ## 配置文件
 
 - [build.env](configs/build.env)：构图参数。
 - [storage-rdma.env](configs/storage-rdma.env)：存储节点 RDMA 参数。
 - [compute-rdma.env](configs/compute-rdma.env)：计算节点 RDMA 参数。
+- [storage-erdma.env](configs/storage-erdma.env)：存储节点 CM/eRDMA 参数。
+- [compute-erdma.env](configs/compute-erdma.env)：计算节点 CM/eRDMA 参数。
 
 配置文件中的每个字段都带有注释，可以复制后修改。

@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
     if (c.help)
       return 0;
     rdma_hnsw::StorageNode node(
-        {c.index, c.transport, c.bind, c.port, c.ib_device, c.ib_port});
+        {c.index, c.transport, c.bind, c.port, c.ib_device, c.ib_port, c.rdma_connection, c.rdma_timeout_ms});
     if (c.transport == rdma_hnsw::TransportKind::Rdma)
       return node.serve();
 

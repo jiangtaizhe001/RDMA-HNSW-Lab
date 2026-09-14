@@ -22,12 +22,14 @@ third_party/hnswlib/     vendored hnswlib 头文件
 ## 构建
 
 ```bash
-cmake -S . -B build -DENABLE_RDMA=ON -DBUILD_TESTING=ON
+cmake -S . -B build -DENABLE_RDMA=ON -DENABLE_RDMA_CM=ON -DBUILD_TESTING=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-只使用 mmap 时可以设置 `-DENABLE_RDMA=OFF`。启用 RDMA 时，CMake 查找 `libibverbs` 并构建 verbs 后端；运行时通过 `--ib-device` 和 `--ib-port` 指定设备，例如 `mlx5_0` 和 `1`。
+只使用 mmap 时可以设置 `-DENABLE_RDMA=OFF`。启用 RDMA 时，CMake 查找 `libibverbs`；启用 CM 时还需要 `librdmacm` 的头文件和库。确认输出包含 `librdmacm connection backend enabled` 后，才能使用 CM 后端。
+
+`--rdma-connection ib`（默认）保留原有 InfiniBand LID 建连方式；`--rdma-connection cm` 使用 librdmacm 按 IP 建连，供 eRDMA 等环境使用。完整部署、环境检查、配置和验证步骤见 [eRDMA 使用说明](docs/erdma.md)。
 
 ## 构建索引
 
@@ -54,13 +56,14 @@ add_subdirectory(/path/to/RDMA-HNSW-lab rdma_hnsw)
 target_link_libraries(my_program PRIVATE rdma_hnsw)
 ```
 
-安装后也可以直接链接静态库：
+安装后也可以直接链接静态库。下面对应同时启用 IB 和 CM 的构建（实际库目录以安装输出为准）：
 
 ```bash
 cmake --install build --prefix "$HOME/.local"
 g++ -std=c++20 -I"$HOME/.local/include" app.cc \
   "$HOME/.local/lib/librdma_hnsw_runtime.a" \
-  "$HOME/.local/lib/librdma_hnsw_core.a" -libverbs -pthread -o app
+  "$HOME/.local/lib/librdma_hnsw_rdma.a" \
+  "$HOME/.local/lib/librdma_hnsw_core.a" -lrdmacm -libverbs -pthread -o app
 ```
 
 RDMA 模式下 `ComputeNodeConfig::index_path` 可以为空，连接后自动获取远程索引元数据；mmap 模式需要提供本地索引路径。
@@ -78,7 +81,7 @@ RDMA 模式下 `ComputeNodeConfig::index_path` 可以为空，连接后自动获
   --queries-count 1000 --ef-search 64 --k 10
 ```
 
-RDMA 控制面使用 TCP 交换连接信息和更新请求，图数据通过 RDMA READ 访问。存储端支持多个 RDMA session，每个 session 使用独立 QP、CQ 和 mailbox；更新在存储侧串行处理。
+上述命令默认使用 `ib` 后端，以 TCP 交换连接信息和更新请求。切换到 `cm` 时，两端均添加 `--rdma-connection cm`，使用 RDMA 网络上的实际 IP 地址，控制消息改走 SEND/RECV。两种后端均通过 RDMA READ 访问图数据；每个 session 使用独立 QP、CQ 和 mailbox，更新在存储侧串行处理。
 
 mmap 是共享文件后端，适合单机开发和回归测试：
 

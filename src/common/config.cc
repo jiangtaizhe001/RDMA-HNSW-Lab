@@ -42,6 +42,13 @@ Config parse_config(int argc, char **argv, const std::string &mode) {
       c.bind = value(i, argc, argv);
     else if (a == "--ib-device")
       c.ib_device = value(i, argc, argv);
+    else if (a == "--rdma-connection") {
+      const auto backend = value(i, argc, argv);
+      if (backend != "ib" && backend != "cm")
+        throw std::invalid_argument("rdma-connection must be ib or cm");
+      c.rdma_connection = backend == "cm" ? RdmaConnection::Cm : RdmaConnection::Ib;
+    } else if (a == "--rdma-timeout-ms")
+      c.rdma_timeout_ms = as_size(value(i, argc, argv));
     else if (a == "--workload")
       c.workload = value(i, argc, argv);
     else if (a == "--update-op")
@@ -115,6 +122,8 @@ Config parse_config(int argc, char **argv, const std::string &mode) {
       throw std::invalid_argument("--generate needs --dim");
   } else if (c.index.empty() && !(mode == "client" && c.transport == TransportKind::Rdma))
     throw std::invalid_argument("missing --index");
+  if (c.port == 0 || c.port > 65535 || c.rdma_timeout_ms == 0 || c.rdma_timeout_ms > 600000)
+    throw std::invalid_argument("port must be 1..65535; rdma-timeout-ms must be 1..600000");
   if (c.M < 2 || c.k == 0 || c.ef_search < c.k || c.ib_port == 0 ||
       c.ib_port > 255)
     throw std::invalid_argument("invalid M/k/ef-search/ib-port");
@@ -134,6 +143,8 @@ void print_usage(const std::string &mode) {
       << "  --input FILE / --generate N --dim D  input vectors\n"
       << "  --output FILE or --index FILE         index path\n"
       << "  --transport mmap|rdma                 transport backend\n"
+      << "  --rdma-connection ib|cm               IB LID (default) or RDMA CM (eRDMA)\n"
+      << "  --rdma-timeout-ms N                   CM handshake/operation deadline (10000)\n"
       << "  --read-strategy fixed       built-in strategy; add custom "
          "strategies through the API\n"
       << "  --M N --ef-construction N --ef-search N --k N\n"

@@ -15,6 +15,8 @@ struct StorageNodeConfig {
   std::size_t port = 18515;
   std::string ib_device;
   std::size_t ib_port = 1;
+  RdmaConnection rdma_connection = RdmaConnection::Ib; // Used only with Rdma.
+  std::size_t rdma_timeout_ms = 10000; // CM only; idle sessions do not expire.
 };
 
 class StorageNode {

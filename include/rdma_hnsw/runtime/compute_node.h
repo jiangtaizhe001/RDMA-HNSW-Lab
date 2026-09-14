@@ -21,6 +21,8 @@ struct ComputeNodeConfig {
   std::size_t k = 10;
   std::size_t prefix_granularity = 4;
   std::size_t cache_capacity = 100000;
+  RdmaConnection rdma_connection = RdmaConnection::Ib; // Used only with Rdma.
+  std::size_t rdma_timeout_ms = 10000; // CM only: per-stage/operation timeout.
 };
 
 // Reusable compute-side facade.  It owns the selected transport and query

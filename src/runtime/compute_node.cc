@@ -1,5 +1,6 @@
 #include "rdma_hnsw/runtime/compute_node.h"
 #include "rdma_hnsw/transport/rdma_transport.h"
+#include "rdma_hnsw/transport/rdma_cm_transport.h"
 #include "rdma_hnsw/transport/transport.h"
 #include <cstring>
 #include <limits>
@@ -40,8 +41,10 @@ ComputeNode::ComputeNode(ComputeNodeConfig config)
 
 void ComputeNode::open() {
   if (config_.transport == TransportKind::Rdma) {
-    transport_ = make_rdma_client(config_.host, config_.port, config_.ib_device,
-                                  config_.ib_port);
+    transport_ = config_.rdma_connection == RdmaConnection::Cm
+        ? make_rdma_cm_client(config_.host, config_.port, config_.ib_device,
+                              config_.ib_port, config_.rdma_timeout_ms)
+        : make_rdma_client(config_.host, config_.port, config_.ib_device, config_.ib_port);
     catalog_ = read_remote_catalog(*transport_);
   } else {
     if (config_.index_path.empty())
@@ -110,10 +113,11 @@ UpdateResult ComputeNode::update(const UpdateRequest &request) {
     return result;
   }
   const auto result = transport_->submit_update(request);
-  // Insertion grows the offset table and shifts records.  Refresh metadata so
-  // subsequent remote reads use the new addresses. Upsert/erase keep offsets
-  // stable but still advance generations used by the length cache.
-  if (result.ok && request.op == update_op::Insert)
+  // A CM update publishes the latest global snapshot to this session. Another
+  // client may have inserted nodes since our last snapshot, so even an upsert
+  // or erase can change this client's offset table. Keep catalog and MR paired.
+  if (result.ok && (request.op == update_op::Insert ||
+                    config_.rdma_connection == RdmaConnection::Cm))
     refresh_remote_catalog(catalog_, *engine_, *transport_);
   return result;
 }
