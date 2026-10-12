@@ -37,6 +37,10 @@ target_include_directories(rdma_hnsw_runtime PUBLIC include third_party)
 target_link_libraries(rdma_hnsw_runtime PUBLIC rdma_hnsw_core)
 target_compile_options(rdma_hnsw_runtime PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(baseline1_experiment experiments/baseline1_main.cc)
+target_link_libraries(baseline1_experiment PRIVATE rdma_hnsw_runtime)
+target_compile_options(baseline1_experiment PRIVATE -Wall -Wextra -Wpedantic)
+
 target_link_libraries(storage_server PRIVATE rdma_hnsw_runtime)
 target_link_libraries(compute_client PRIVATE rdma_hnsw_runtime)
 
@@ -126,6 +130,13 @@ if(BUILD_TESTING)
   add_test(NAME read_strategy_test COMMAND read_strategy_test)
   add_test(NAME hnsw_builder_test COMMAND hnsw_builder_test)
   add_test(NAME runtime_api_test COMMAND runtime_api_test)
+  # Baseline 1 experiment smoke test: build a tiny index on the fly, run a few
+  # queries, and export CSV.  Proves the measurement/export path is wired up.
+  add_test(NAME baseline1_experiment_smoke
+           COMMAND baseline1_experiment --smoke
+                   --index ${CMAKE_BINARY_DIR}/baseline1_smoke.bin
+                   --out ${CMAKE_BINARY_DIR}/baseline1_smoke.csv
+                   --summary-out ${CMAKE_BINARY_DIR}/baseline1_smoke_summary.csv)
   # Existing tests use assert(), including operations inside the assertions.
   # Keep them active when students use the default Release build.
   foreach(test_target cm_protocol_test graph_store_test read_strategy_test hnsw_builder_test runtime_api_test)

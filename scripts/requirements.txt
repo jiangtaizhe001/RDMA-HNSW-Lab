@@ -1,0 +1,27 @@
+# Python dependencies for the Baseline 1 dataset preparation and analysis scripts
+# (scripts/convert_sift.py, scripts/analyze_baseline1.py).
+#
+# The core system, the read strategies and the experiment driver are pure C++
+# and need none of this.  Python is only used for data preparation (SIFT .fvecs
+# subsetting + offline ground truth) and post-processing/charts.
+#
+# Recreate the virtual environment from scratch with:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r scripts/requirements.txt
+#
+# Direct dependencies (pinned to the versions verified on 2026-10):
+numpy==2.5.3
+matplotlib==3.11.2
+
+# Transitive dependencies of the above, recorded for a fully reproducible
+# offline rebuild (pip only needs the two direct pins above):
+#   contourpy==1.4.0
+#   cycler==0.12.1
+#   fonttools==4.66.1
+#   kiwisolver==1.5.1
+#   packaging==26.3
+#   pillow==12.3.0
+#   pyparsing==3.3.3
+#   python-dateutil==2.9.0.post0
+#   six==1.17.0

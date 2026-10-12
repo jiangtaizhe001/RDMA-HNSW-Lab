@@ -67,9 +67,10 @@ Config parse_config(int argc, char **argv, const std::string &mode) {
     }
     else if (a == "--read-strategy") {
       const auto policy = value(i, argc, argv);
-      if (policy != "fixed" && policy != "header_actual" &&
-          policy != "header" && policy != "cached_length" &&
-          policy != "cached" && policy != "prefix")
+      if (policy != "fixed" && policy != "baseline1" &&
+          policy != "header_actual" && policy != "header" &&
+          policy != "cached_length" && policy != "cached" &&
+          policy != "prefix")
         throw std::invalid_argument("unknown read strategy: " + policy);
       c.policy = read_policy_from_string(policy);
     }
@@ -145,8 +146,9 @@ void print_usage(const std::string &mode) {
       << "  --transport mmap|rdma                 transport backend\n"
       << "  --rdma-connection ib|cm               IB LID (default) or RDMA CM (eRDMA)\n"
       << "  --rdma-timeout-ms N                   CM handshake/operation deadline (10000)\n"
-      << "  --read-strategy fixed       built-in strategy; add custom "
-         "strategies through the API\n"
+      << "  --read-strategy fixed|baseline1  built-in Baseline 1 strategy "
+         "(read full fixed-capacity neighbor slots); add custom strategies "
+         "through the API\n"
       << "  --M N --ef-construction N --ef-search N --k N\n"
       << "  --queries FILE --updates FILE\n"
       << "  --base FILE                             vectors for exact recall\n"

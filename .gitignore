@@ -4,3 +4,10 @@
 *.csv
 *.bin
 .cache
+papers/
+tmp/
+data/
+out/
+demo-data/
+.venv/
+.vscode/

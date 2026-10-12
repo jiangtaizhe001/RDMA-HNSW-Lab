@@ -50,8 +50,11 @@ QueryEngine::NodeData QueryEngine::read_node(NodeId id) {
   const auto n = sizeof(NodeDiskHeader) + catalog_.header.dim * sizeof(float);
   std::vector<byte> b(n);
   const auto r = transport_.read({catalog_.offsets[id], 0}, b);
-  stats_.reads.read_ops++;
-  stats_.reads.requested_bytes += n;
+  // Node (header + vector) traffic is accounted separately from the neighbor
+  // region so that `requested_bytes == useful_bytes + wasted_bytes` holds for
+  // neighbor reads and node traffic can be reported on its own.
+  stats_.reads.node_reads++;
+  stats_.reads.node_bytes += n;
   if (!r.ok || r.bytes != n)
     throw std::runtime_error("remote node read failed");
   NodeDiskHeader dh{};

@@ -43,6 +43,8 @@ inline ReadPolicy read_policy_from_string(const std::string &s) {
     return ReadPolicy::CachedLength;
   if (s == "prefix")
     return ReadPolicy::Prefix;
+  // "fixed" is the built-in Baseline 1 strategy; "baseline1" is an explicit,
+  // self-documenting alias for it.
   return ReadPolicy::Fixed;
 }
 inline TransportKind transport_from_string(const std::string &s) {
