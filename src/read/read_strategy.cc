@@ -1,5 +1,6 @@
 #include "rdma_hnsw/read/read_strategy.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -39,11 +40,14 @@ NeighborReadResult Baseline1FixedStrategy::read(const RemoteNodeView &v,
 
   // A short read would silently fabricate neighbours from uninitialised bytes,
   // so it is reported as an error instead of being truncated.
-  if (!r.ok || r.bytes != n)
+  if (!r.ok || r.bytes != n) {
+    if (c.metrics)
+      c.metrics->failed_reads++;
     return {{}, false,
             "short fixed neighbor read: " +
                 (r.error.empty() ? std::string("unexpected byte count")
                                  : r.error)};
+  }
 
   std::uint32_t degree{};
   std::memcpy(&degree, b.data(), sizeof(degree));
@@ -60,6 +64,73 @@ NeighborReadResult Baseline1FixedStrategy::read(const RemoteNodeView &v,
   // are zero padding and must never be returned as neighbour ids.
   return decode(std::vector<byte>(b.begin() + sizeof(std::uint32_t), b.end()),
                 effective);
+}
+
+NeighborReadResult Baseline2HeaderFirstStrategy::read(const RemoteNodeView &v,
+                                                      ReadContext &c) {
+  // An empty layer has no header to read: reject before touching the transport
+  // (same contract as Baseline 1, docs/baseline2-plan.md section 3.3).
+  if (v.capacity == 0)
+    return {{}, false, "baseline2_header_first: layer capacity is zero"};
+
+  // ---- first read: only the leading 4-byte degree word -------------------
+  std::array<byte, sizeof(std::uint32_t)> hdr{};
+  const auto hr = c.transport.read({v.layer_offset, 0}, hdr);
+  if (!hr.ok || hr.bytes != hdr.size()) {
+    if (c.metrics)
+      c.metrics->failed_reads++;
+    return {{}, false,
+            "baseline2_header_first: header read failed: " +
+                (hr.error.empty() ? std::string("unexpected byte count")
+                                  : hr.error)};
+  }
+  if (c.metrics) {
+    c.metrics->read_ops++;
+    c.metrics->header_reads++; // a dedicated degree read, not bundled
+    c.metrics->requested_bytes += hdr.size();
+  }
+
+  std::uint32_t raw{};
+  std::memcpy(&raw, hdr.data(), sizeof(raw));
+  // Remote data is untrusted: a corrupt degree must never drive the second
+  // read past the layer's fixed slot array.
+  const auto degree =
+      static_cast<std::uint32_t>(std::min<std::size_t>(raw, v.capacity));
+
+  // ---- degree == 0: nothing follows, so the dependent read is skipped ----
+  if (degree == 0) {
+    if (c.metrics) {
+      c.metrics->zero_degree_layers++;
+      c.metrics->useful_bytes += hdr.size(); // wasted is identically zero
+      c.metrics->layer_reads++;
+      c.metrics->capacity_sum += v.capacity;
+    }
+    return {{}, true, {}};
+  }
+
+  // ---- second read: offset and length both depend on the first read ------
+  const std::size_t n = degree * sizeof(NodeId);
+  std::vector<byte> b(n);
+  const auto nr =
+      c.transport.read({v.layer_offset + sizeof(std::uint32_t), 0}, b);
+  if (!nr.ok || nr.bytes != n) {
+    if (c.metrics)
+      c.metrics->failed_reads++;
+    return {{}, false,
+            "baseline2_header_first: neighbor read failed: " +
+                (nr.error.empty() ? std::string("unexpected byte count")
+                                  : nr.error)};
+  }
+  if (c.metrics) {
+    c.metrics->read_ops++;
+    c.metrics->dependent_reads++; // offset/length derived from the header read
+    c.metrics->requested_bytes += n;
+    c.metrics->useful_bytes += hdr.size() + n;
+    c.metrics->layer_reads++;
+    c.metrics->capacity_sum += v.capacity;
+    c.metrics->degree_sum += degree;
+  }
+  return decode(b, degree);
 }
 
 void ReadMetrics::merge(const ReadMetrics &o) {
@@ -79,13 +150,17 @@ void ReadMetrics::merge(const ReadMetrics &o) {
   node_bytes += o.node_bytes;
   degree_sum += o.degree_sum;
   capacity_sum += o.capacity_sum;
+  failed_reads += o.failed_reads;
+  zero_degree_layers += o.zero_degree_layers;
 }
 
 std::unique_ptr<NeighborReadStrategy> make_read_strategy(ReadPolicy p) {
-  if (p != ReadPolicy::Fixed)
-    throw std::invalid_argument("read strategy is a student extension; "
-                                "implement and inject it before selecting " +
-                                to_string(p));
-  return std::make_unique<Baseline1FixedStrategy>();
+  if (p == ReadPolicy::Fixed)
+    return std::make_unique<Baseline1FixedStrategy>();
+  if (p == ReadPolicy::HeaderActual)
+    return std::make_unique<Baseline2HeaderFirstStrategy>();
+  throw std::invalid_argument("read strategy is a student extension; "
+                              "implement and inject it before selecting " +
+                              to_string(p));
 }
 } // namespace rdma_hnsw

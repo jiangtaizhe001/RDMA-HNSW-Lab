@@ -137,6 +137,12 @@ if(BUILD_TESTING)
                    --index ${CMAKE_BINARY_DIR}/baseline1_smoke.bin
                    --out ${CMAKE_BINARY_DIR}/baseline1_smoke.csv
                    --summary-out ${CMAKE_BINARY_DIR}/baseline1_smoke_summary.csv)
+  # Baseline 2 (header-first) smoke test: same driver, header_actual strategy.
+  add_test(NAME baseline2_experiment_smoke
+           COMMAND baseline1_experiment --smoke --read-strategy header_actual
+                   --index ${CMAKE_BINARY_DIR}/baseline2_smoke.bin
+                   --out ${CMAKE_BINARY_DIR}/baseline2_smoke.csv
+                   --summary-out ${CMAKE_BINARY_DIR}/baseline2_smoke_summary.csv)
   # Existing tests use assert(), including operations inside the assertions.
   # Keep them active when students use the default Release build.
   foreach(test_target cm_protocol_test graph_store_test read_strategy_test hnsw_builder_test runtime_api_test)

@@ -34,6 +34,9 @@ struct ReadMetrics {
   std::uint64_t node_bytes{};     // bytes requested for node region reads
   std::uint64_t degree_sum{};     // sum of min(degree, capacity) over reads
   std::uint64_t capacity_sum{};   // sum of capacity over reads
+  // Added for Baseline 2 instrumentation (docs/baseline2-plan.md T2).
+  std::uint64_t failed_reads{};       // transport reads that failed or short-read
+  std::uint64_t zero_degree_layers{}; // layers with degree == 0 (no 2nd read)
   void merge(const ReadMetrics &o);
 };
 
@@ -77,6 +80,19 @@ class Baseline1FixedStrategy final : public NeighborReadStrategy {
 public:
   NeighborReadResult read(const RemoteNodeView &v, ReadContext &c) override;
   const char *name() const override { return "baseline1_fixed"; }
+};
+
+// Baseline 2: header-first.  The layer's leading 4-byte word stores the actual
+// degree; this strategy reads that word first and then asks the transport for
+// exactly `degree` neighbour slots.  The second read's offset and length both
+// depend on the first read's result, so the two reads cannot be pipelined --
+// that data dependency is the whole point of the experiment
+// (docs/baseline2-plan.md sections 0 and 5).  Selected through
+// `--read-strategy header_actual` / `ReadPolicy::HeaderActual`.
+class Baseline2HeaderFirstStrategy final : public NeighborReadStrategy {
+public:
+  NeighborReadResult read(const RemoteNodeView &v, ReadContext &c) override;
+  const char *name() const override { return "baseline2_header_first"; }
 };
 
 std::unique_ptr<NeighborReadStrategy> make_read_strategy(ReadPolicy policy);

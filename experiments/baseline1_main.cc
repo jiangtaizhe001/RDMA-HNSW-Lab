@@ -1,9 +1,14 @@
-// Baseline 1 experiment driver (docs/baseline1-plan.md, task T4).
+// Read-strategy experiment driver (docs/baseline1-plan.md T4, baseline2-plan.md T4).
 //
-// Purpose: measure the cost of reading the full fixed-capacity neighbor slot
-// array for every (node, level) touched by a query, with per-query latency,
-// neighbor-region bytes, node-region bytes and read-op counts, and export the
-// raw samples as CSV.
+// Runs any built-in NeighborReadStrategy selected with --read-strategy
+// (fixed|baseline1 or header_actual|header).  Baseline 1 measures the cost of
+// reading the full fixed-capacity neighbour slot array; Baseline 2 reads the
+// degree word first and then only the actual neighbours.  Both share the exact
+// same workload, metric accounting and CSV contract so their rows pair up.
+//
+// Purpose of the driver: measure the cost of every (node, level) neighbour read
+// touched by a query, with per-query latency, neighbour-region bytes,
+// node-region bytes and read-op counts, and export the raw samples as CSV.
 //
 // The driver is deliberately self-contained: it never modifies the query engine
 // or the read strategy internals, it only injects a NeighborReadStrategy and
@@ -67,9 +72,16 @@ struct Options {
   std::size_t dim = 32;
   std::size_t M = 16;
   double update_ratio = 0.1;
+  rh::ReadPolicy policy = rh::ReadPolicy::Fixed;
   bool smoke = false;
   bool help = false;
 };
+
+// Human-readable label recorded in the CSV so Baselines 1 and 2 can be paired.
+const char *strategy_label(rh::ReadPolicy p) {
+  return p == rh::ReadPolicy::HeaderActual ? "baseline2_header_first"
+                                           : "baseline1_fixed";
+}
 
 std::string next_value(int &i, int argc, char **argv) {
   if (++i >= argc)
@@ -103,7 +115,7 @@ void print_usage() {
       << "  --dataset --label NAME     labels recorded in the summary\n"
       << "  --dim N --M N --seed N     synthetic data / smoke parameters\n"
       << "  --ef-construction N        recorded in the summary (not derivable)\n"
-      << "  --read-strategy NAME       fixed|baseline1 (only Baseline 1 here)\n"
+      << "  --read-strategy NAME       fixed|baseline1|header_actual|header\n"
       << "  --smoke                    build a tiny index if missing and query it\n"
       << "  --help                     show this help\n";
 }
@@ -183,9 +195,13 @@ Options parse(int argc, char **argv) {
   if (o.update_op != "none" && o.update_op != "insert" &&
       o.update_op != "upsert" && o.update_op != "erase")
     throw std::invalid_argument("update-op must be none, insert, upsert or erase");
-  if (o.read_strategy != "baseline1" && o.read_strategy != "fixed")
+  if (o.read_strategy == "fixed" || o.read_strategy == "baseline1")
+    o.policy = rh::ReadPolicy::Fixed;
+  else if (o.read_strategy == "header_actual" || o.read_strategy == "header")
+    o.policy = rh::ReadPolicy::HeaderActual;
+  else
     throw std::invalid_argument(
-        "baseline1_experiment only implements baseline1/fixed");
+        "unsupported --read-strategy (use fixed|baseline1|header_actual|header)");
   if (o.k == 0 || o.ef_search < o.k)
     throw std::invalid_argument("require k > 0 and ef-search >= k");
   if (o.update_ratio < 0.0 || o.update_ratio > 1.0)
@@ -251,6 +267,10 @@ rh::ReadMetrics diff_metrics(const rh::ReadMetrics &a, const rh::ReadMetrics &b)
   d.useful_bytes = a.useful_bytes - b.useful_bytes;
   d.wasted_bytes = a.wasted_bytes - b.wasted_bytes;
   d.read_ops = a.read_ops - b.read_ops;
+  d.header_reads = a.header_reads - b.header_reads;
+  d.dependent_reads = a.dependent_reads - b.dependent_reads;
+  d.zero_degree_layers = a.zero_degree_layers - b.zero_degree_layers;
+  d.failed_reads = a.failed_reads - b.failed_reads;
   d.node_reads = a.node_reads - b.node_reads;
   d.node_bytes = a.node_bytes - b.node_bytes;
   d.layer_reads = a.layer_reads - b.layer_reads;
@@ -277,7 +297,8 @@ double percentile(std::vector<double> v, double p) {
 }
 
 struct Totals {
-  std::uint64_t requested{}, useful{}, wasted{}, read_ops{}, node_reads{},
+  std::uint64_t requested{}, useful{}, wasted{}, read_ops{}, header_reads{},
+      dependent_reads{}, zero_degree_layers{}, failed_reads{}, node_reads{},
       node_bytes{}, layer_reads{}, degree_sum{}, capacity_sum{};
 };
 
@@ -286,6 +307,10 @@ void add(Totals &t, const rh::ReadMetrics &m) {
   t.useful += m.useful_bytes;
   t.wasted += m.wasted_bytes;
   t.read_ops += m.read_ops;
+  t.header_reads += m.header_reads;
+  t.dependent_reads += m.dependent_reads;
+  t.zero_degree_layers += m.zero_degree_layers;
+  t.failed_reads += m.failed_reads;
   t.node_reads += m.node_reads;
   t.node_bytes += m.node_bytes;
   t.layer_reads += m.layer_reads;
@@ -348,15 +373,16 @@ int main(int argc, char **argv) {
                                           : rh::TransportKind::Mmap;
     cfg.host = o.host;
     cfg.port = o.port;
-    cfg.read_policy = rh::ReadPolicy::Fixed;
+    cfg.read_policy = o.policy;
     cfg.distance = inner ? rh::DistanceKind::InnerProduct : rh::DistanceKind::L2;
     cfg.ef_search = o.ef_search;
     cfg.k = o.k;
 
     rh::ComputeNode node(cfg);
-    auto inject = [&node] {
-      node.query_engine().set_read_strategy(
-          std::make_unique<rh::Baseline1FixedStrategy>());
+    // Re-install the configured strategy through the same factory the CLI uses,
+    // so the experiment can never drift from the production wiring.
+    auto inject = [&node, &o] {
+      node.query_engine().set_read_strategy(rh::make_read_strategy(o.policy));
     };
     inject();
 
@@ -505,13 +531,17 @@ int main(int argc, char **argv) {
       if (!out)
         throw std::runtime_error("cannot write --out file: " + o.out);
       out << "query_idx,latency_us,requested_bytes,useful_bytes,wasted_bytes,"
-             "read_ops,node_bytes,layer_reads,degree_sum,capacity_sum\n";
+             "read_ops,header_reads,dependent_reads,zero_degree_layers,"
+             "failed_reads,node_bytes,layer_reads,degree_sum,capacity_sum\n";
       for (std::size_t i = 0; i < samples.size(); ++i) {
         const auto &s = samples[i];
         out << i << ',' << s.latency_us << ',' << s.m.requested_bytes << ','
             << s.m.useful_bytes << ',' << s.m.wasted_bytes << ','
-            << s.m.read_ops << ',' << s.m.node_bytes << ',' << s.m.layer_reads
-            << ',' << s.m.degree_sum << ',' << s.m.capacity_sum << '\n';
+            << s.m.read_ops << ',' << s.m.header_reads << ','
+            << s.m.dependent_reads << ',' << s.m.zero_degree_layers << ','
+            << s.m.failed_reads << ',' << s.m.node_bytes << ','
+            << s.m.layer_reads << ',' << s.m.degree_sum << ','
+            << s.m.capacity_sum << '\n';
       }
     }
 
@@ -528,10 +558,11 @@ int main(int argc, char **argv) {
                "queries,updates,qps,qps_end_to_end,wall_s,latency_mean_us,"
                "latency_p50_us,latency_p95_us,latency_p99_us,requested_bytes,"
                "useful_bytes,wasted_bytes,waste_ratio,node_bytes,"
-               "neighbor_share,read_ops,layer_reads,capacity_utilization,"
-               "avg_degree,recall\n";
+               "neighbor_share,read_ops,layer_reads,header_reads,"
+               "dependent_reads,zero_degree_layers,failed_reads,"
+               "capacity_utilization,avg_degree,recall\n";
       const auto end_nodes = node.query_engine().catalog().header.node_count;
-      out << "baseline1_fixed," << csv_escape(o.dataset) << ','
+      out << strategy_label(o.policy) << ',' << csv_escape(o.dataset) << ','
           << csv_escape(o.label) << ',' << dim << ',' << start_nodes << ','
           << end_nodes << ',' << catalog.header.M << ',' << o.ef_construction
           << ',' << o.ef_search << ',' << o.k << ',' << o.transport << ','
@@ -542,11 +573,13 @@ int main(int argc, char **argv) {
           << totals.requested << ',' << totals.useful << ',' << totals.wasted
           << ',' << waste_ratio << ',' << totals.node_bytes << ','
           << neighbor_share << ',' << totals.read_ops << ',' << totals.layer_reads
-          << ',' << cap_util << ',' << avg_degree << ',' << recall << '\n';
+          << ',' << totals.header_reads << ',' << totals.dependent_reads << ','
+          << totals.zero_degree_layers << ',' << totals.failed_reads << ','
+          << cap_util << ',' << avg_degree << ',' << recall << '\n';
     }
 
     // --- stdout summary ----------------------------------------------------
-    std::cout << "strategy=baseline1_fixed"
+    std::cout << "strategy=" << strategy_label(o.policy)
               << " dim=" << dim << " M=" << catalog.header.M
               << " ef_search=" << o.ef_search << " k=" << o.k
               << " update_op=" << o.update_op
@@ -565,13 +598,21 @@ int main(int argc, char **argv) {
               << " node_bytes=" << totals.node_bytes
               << " neighbor_share=" << neighbor_share
               << " read_ops=" << totals.read_ops
-              << " layer_reads=" << totals.layer_reads << '\n'
+              << " layer_reads=" << totals.layer_reads
+              << " header_reads=" << totals.header_reads
+              << " dependent_reads=" << totals.dependent_reads
+              << " zero_degree_layers=" << totals.zero_degree_layers << '\n'
               << "capacity_utilization=" << cap_util
               << " avg_degree=" << avg_degree << " recall=" << recall
               << " wall_s=" << wall_s << '\n';
     if (totals.requested != totals.useful + totals.wasted)
       throw std::runtime_error(
           "neighbor byte identity violated: requested != useful + wasted");
+    if (o.policy == rh::ReadPolicy::HeaderActual &&
+        totals.read_ops != totals.header_reads + totals.dependent_reads)
+      throw std::runtime_error(
+          "Baseline 2 identity violated: read_ops != header_reads + "
+          "dependent_reads");
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "baseline1_experiment: " << e.what() << '\n';

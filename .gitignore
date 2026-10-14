@@ -11,3 +11,4 @@ out/
 demo-data/
 .venv/
 .vscode/
+scripts/__pycache__
