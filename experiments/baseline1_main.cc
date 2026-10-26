@@ -37,6 +37,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -71,16 +72,43 @@ struct Options {
   std::size_t seed = 42;
   std::size_t dim = 32;
   std::size_t M = 16;
+  // Baseline 3 (docs/baseline3-plan.md T5/T6).
+  std::size_t cache_capacity = 100000;
+  std::size_t prefix_granularity = 4;
+  std::size_t update_hot_size = 0; // 0 -> max(1, node_count/100)
+  std::string update_distribution = "roundrobin";
   double update_ratio = 0.1;
   rh::ReadPolicy policy = rh::ReadPolicy::Fixed;
   bool smoke = false;
   bool help = false;
 };
 
-// Human-readable label recorded in the CSV so Baselines 1 and 2 can be paired.
+// Human-readable label recorded in the CSV so the baselines can be paired.
 const char *strategy_label(rh::ReadPolicy p) {
-  return p == rh::ReadPolicy::HeaderActual ? "baseline2_header_first"
-                                           : "baseline1_fixed";
+  switch (p) {
+  case rh::ReadPolicy::Fixed:
+    return "baseline1_fixed";
+  case rh::ReadPolicy::HeaderActual:
+    return "baseline2_header_first";
+  case rh::ReadPolicy::CachedLength:
+    return "baseline3_cached_length";
+  case rh::ReadPolicy::Prefix:
+    break;
+  }
+  throw std::invalid_argument("no experiment label for this read policy");
+}
+
+// Compactly encode a per-level counter vector as "0:12;1:3".
+std::string format_levels(const std::vector<std::uint64_t> &v) {
+  std::string out;
+  for (std::size_t i = 0; i < v.size(); ++i) {
+    if (v[i] == 0)
+      continue;
+    if (!out.empty())
+      out += ';';
+    out += std::to_string(i) + ":" + std::to_string(v[i]);
+  }
+  return out;
 }
 
 std::string next_value(int &i, int argc, char **argv) {
@@ -115,7 +143,15 @@ void print_usage() {
       << "  --dataset --label NAME     labels recorded in the summary\n"
       << "  --dim N --M N --seed N     synthetic data / smoke parameters\n"
       << "  --ef-construction N        recorded in the summary (not derivable)\n"
-      << "  --read-strategy NAME       fixed|baseline1|header_actual|header\n"
+      << "  --read-strategy NAME       fixed|baseline1|header_actual|header|"
+         "cached_length|cached\n"
+      << "  --cache-capacity N         length-cache entries (default 100000; "
+         "cached_length only)\n"
+      << "  --prefix-granularity N     prefix granularity G (default 4; reserved "
+         "for the prefix strategy)\n"
+      << "  --update-distribution D    roundrobin|random|hot (default roundrobin)\n"
+      << "  --update-hot-size K        hot id count for 'hot' (default "
+         "node_count/100)\n"
       << "  --smoke                    build a tiny index if missing and query it\n"
       << "  --help                     show this help\n";
 }
@@ -185,6 +221,14 @@ Options parse(int argc, char **argv) {
       o.dim = as_size(next_value(i, argc, argv));
     else if (a == "--M")
       o.M = as_size(next_value(i, argc, argv));
+    else if (a == "--cache-capacity")
+      o.cache_capacity = as_size(next_value(i, argc, argv));
+    else if (a == "--prefix-granularity")
+      o.prefix_granularity = as_size(next_value(i, argc, argv));
+    else if (a == "--update-distribution")
+      o.update_distribution = next_value(i, argc, argv);
+    else if (a == "--update-hot-size")
+      o.update_hot_size = as_size(next_value(i, argc, argv));
     else if (a == "--smoke")
       o.smoke = true;
     else
@@ -199,9 +243,16 @@ Options parse(int argc, char **argv) {
     o.policy = rh::ReadPolicy::Fixed;
   else if (o.read_strategy == "header_actual" || o.read_strategy == "header")
     o.policy = rh::ReadPolicy::HeaderActual;
+  else if (o.read_strategy == "cached_length" || o.read_strategy == "cached")
+    o.policy = rh::ReadPolicy::CachedLength;
   else
     throw std::invalid_argument(
-        "unsupported --read-strategy (use fixed|baseline1|header_actual|header)");
+        "unsupported --read-strategy (use fixed|baseline1|header_actual|header|"
+        "cached_length|cached)");
+  if (o.update_distribution != "roundrobin" &&
+      o.update_distribution != "random" && o.update_distribution != "hot")
+    throw std::invalid_argument(
+        "update-distribution must be roundrobin, random or hot");
   if (o.k == 0 || o.ef_search < o.k)
     throw std::invalid_argument("require k > 0 and ef-search >= k");
   if (o.update_ratio < 0.0 || o.update_ratio > 1.0)
@@ -276,6 +327,29 @@ rh::ReadMetrics diff_metrics(const rh::ReadMetrics &a, const rh::ReadMetrics &b)
   d.layer_reads = a.layer_reads - b.layer_reads;
   d.degree_sum = a.degree_sum - b.degree_sum;
   d.capacity_sum = a.capacity_sum - b.capacity_sum;
+  // Baseline 3 counters.
+  d.cache_hits = a.cache_hits - b.cache_hits;
+  d.cache_misses = a.cache_misses - b.cache_misses;
+  d.cache_invalidations = a.cache_invalidations - b.cache_invalidations;
+  d.fallbacks = a.fallbacks - b.fallbacks;
+  d.hint_reads = a.hint_reads - b.hint_reads;
+  d.cold_start_reads = a.cold_start_reads - b.cold_start_reads;
+  d.fallback_bytes = a.fallback_bytes - b.fallback_bytes;
+  d.cache_evictions = a.cache_evictions - b.cache_evictions;
+  d.hint_overestimates = a.hint_overestimates - b.hint_overestimates;
+  d.cache_updates = a.cache_updates - b.cache_updates;
+  d.hint_slots_sum = a.hint_slots_sum - b.hint_slots_sum;
+  d.over_read_slots_sum = a.over_read_slots_sum - b.over_read_slots_sum;
+  auto level_diff = [](const std::vector<std::uint64_t> &x,
+                       const std::vector<std::uint64_t> &y) {
+    std::vector<std::uint64_t> out(x.size(), 0);
+    for (std::size_t i = 0; i < x.size(); ++i)
+      out[i] = x[i] - (i < y.size() ? y[i] : 0);
+    return out;
+  };
+  d.cache_hits_by_level = level_diff(a.cache_hits_by_level, b.cache_hits_by_level);
+  d.cache_misses_by_level =
+      level_diff(a.cache_misses_by_level, b.cache_misses_by_level);
   return d;
 }
 
@@ -300,7 +374,21 @@ struct Totals {
   std::uint64_t requested{}, useful{}, wasted{}, read_ops{}, header_reads{},
       dependent_reads{}, zero_degree_layers{}, failed_reads{}, node_reads{},
       node_bytes{}, layer_reads{}, degree_sum{}, capacity_sum{};
+  // Baseline 3 counters.
+  std::uint64_t cache_hits{}, cache_misses{}, cache_invalidations{},
+      fallbacks{}, hint_reads{}, cold_start_reads{}, fallback_bytes{},
+      cache_evictions{}, hint_overestimates{}, cache_updates{},
+      hint_slots_sum{}, over_read_slots_sum{};
+  std::vector<std::uint64_t> cache_hits_by_level, cache_misses_by_level;
 };
+
+void add_levels(std::vector<std::uint64_t> &dst,
+                const std::vector<std::uint64_t> &src) {
+  if (dst.size() < src.size())
+    dst.resize(src.size(), 0);
+  for (std::size_t i = 0; i < src.size(); ++i)
+    dst[i] += src[i];
+}
 
 void add(Totals &t, const rh::ReadMetrics &m) {
   t.requested += m.requested_bytes;
@@ -316,6 +404,20 @@ void add(Totals &t, const rh::ReadMetrics &m) {
   t.layer_reads += m.layer_reads;
   t.degree_sum += m.degree_sum;
   t.capacity_sum += m.capacity_sum;
+  t.cache_hits += m.cache_hits;
+  t.cache_misses += m.cache_misses;
+  t.cache_invalidations += m.cache_invalidations;
+  t.fallbacks += m.fallbacks;
+  t.hint_reads += m.hint_reads;
+  t.cold_start_reads += m.cold_start_reads;
+  t.fallback_bytes += m.fallback_bytes;
+  t.cache_evictions += m.cache_evictions;
+  t.hint_overestimates += m.hint_overestimates;
+  t.cache_updates += m.cache_updates;
+  t.hint_slots_sum += m.hint_slots_sum;
+  t.over_read_slots_sum += m.over_read_slots_sum;
+  add_levels(t.cache_hits_by_level, m.cache_hits_by_level);
+  add_levels(t.cache_misses_by_level, m.cache_misses_by_level);
 }
 
 std::string csv_escape(const std::string &s) {
@@ -377,12 +479,25 @@ int main(int argc, char **argv) {
     cfg.distance = inner ? rh::DistanceKind::InnerProduct : rh::DistanceKind::L2;
     cfg.ef_search = o.ef_search;
     cfg.k = o.k;
+    cfg.cache_capacity = o.cache_capacity;         // load-bearing for B3
+    cfg.prefix_granularity = o.prefix_granularity; // reserved for B4
 
     rh::ComputeNode node(cfg);
+    // The length cache is owned by the experiment, not by the strategy: in mmap
+    // mode every update() -> reload() rebuilds the QueryEngine and
+    // set_read_strategy() clears ReadContext::length_cache, so a strategy-owned
+    // cache would be wiped on every update (docs/baseline3-plan.md section 0②).
+    rh::SharedLengthCache length_cache = std::make_shared<rh::LengthCache>();
     // Re-install the configured strategy through the same factory the CLI uses,
     // so the experiment can never drift from the production wiring.
-    auto inject = [&node, &o] {
-      node.query_engine().set_read_strategy(rh::make_read_strategy(o.policy));
+    auto inject = [&node, &o, &length_cache] {
+      if (o.policy == rh::ReadPolicy::CachedLength)
+        node.query_engine().set_read_strategy(
+            std::make_unique<rh::Baseline3CachedLengthStrategy>(
+                o.cache_capacity, length_cache));
+      else
+        node.query_engine().set_read_strategy(
+            rh::make_read_strategy(o.policy));
     };
     inject();
 
@@ -412,6 +527,36 @@ int main(int argc, char **argv) {
             ? rh::update_op::Insert
             : (o.update_op == "erase" ? rh::update_op::Erase
                                       : rh::update_op::Upsert);
+
+    // --- update id distribution (docs/baseline3-plan.md T6) ----------------
+    // Every distribution is driven by --seed only, so all strategies see the
+    // exact same update sequence (the precondition for pairing their rows).
+    std::mt19937_64 rng(o.seed * 2654435761ull + 1);
+    std::vector<rh::NodeId> hot_ids;
+    if (o.update_op != "none" && o.update_distribution == "hot" &&
+        start_nodes > 0) {
+      const std::size_t count = start_nodes;
+      const std::size_t hot =
+          o.update_hot_size ? std::min(o.update_hot_size, count)
+                            : std::max<std::size_t>(1, count / 100);
+      std::unordered_set<rh::NodeId> picked;
+      while (hot_ids.size() < hot && picked.size() < count) {
+        const auto id = static_cast<rh::NodeId>(rng() % count);
+        if (picked.insert(id).second)
+          hot_ids.push_back(id);
+      }
+    }
+    const std::size_t hot_size = hot_ids.size();
+    auto pick_update_id = [&](std::size_t ui) -> rh::NodeId {
+      const std::size_t count = std::max<std::size_t>(1, start_nodes);
+      if (update_code == rh::update_op::Insert)
+        return static_cast<rh::NodeId>(start_nodes + ui);
+      if (o.update_distribution == "random")
+        return static_cast<rh::NodeId>(rng() % count);
+      if (o.update_distribution == "hot" && !hot_ids.empty())
+        return hot_ids[ui % hot_ids.size()];
+      return static_cast<rh::NodeId>(ui % count);
+    };
 
     // --- warm-up -----------------------------------------------------------
     for (std::size_t i = 0; i < o.warmup && i < queries.size(); ++i)
@@ -466,18 +611,16 @@ int main(int argc, char **argv) {
       if (update_interval && (i % update_interval) == 0) {
         const auto ui = i / update_interval;
         if (ui < updates.size()) {
-          const auto count = node.query_engine().catalog().header.node_count;
-          const rh::NodeId id =
-              update_code == rh::update_op::Insert
-                  ? static_cast<rh::NodeId>(count + ui)
-                  : static_cast<rh::NodeId>(ui % count);
+          const rh::NodeId id = pick_update_id(ui);
           const rh::UpdateRequest req{
               update_code, id,
               update_code == rh::update_op::Erase ? rh::Vector{} : updates[ui % updates.size()]};
           const auto r = node.update(req);
           if (r.ok) {
             ++updates_applied;
-            inject(); // reload() rebuilt the engine; re-install Baseline 1
+            // reload() rebuilt the engine; re-install the configured strategy.
+            // For B3 the shared LengthCache keeps the learned degrees alive.
+            inject();
           }
         }
       }
@@ -524,6 +667,25 @@ int main(int argc, char **argv) {
             : 0.0;
     const double recall =
         recall_queries ? recall_sum / recall_queries : 0.0;
+    // Baseline 3 aggregates (docs/baseline3-plan.md section 7.2).
+    const std::uint64_t lookups = totals.cache_hits + totals.cache_misses;
+    const double hit_rate =
+        lookups ? static_cast<double>(totals.cache_hits) / lookups : 0.0;
+    const double miss_rate =
+        lookups ? static_cast<double>(totals.cache_misses) / lookups : 0.0;
+    const double underestimate_rate_q =
+        totals.cache_hits
+            ? static_cast<double>(totals.cache_invalidations) / totals.cache_hits
+            : 0.0;
+    const double overestimate_rate =
+        totals.cache_hits
+            ? static_cast<double>(totals.hint_overestimates) / totals.cache_hits
+            : 0.0;
+    const double avg_hint =
+        totals.hint_reads
+            ? static_cast<double>(totals.hint_slots_sum) / totals.hint_reads
+            : 0.0;
+    const std::uint64_t total_read_ops = totals.read_ops + totals.node_reads;
 
     // --- CSV: per-query samples -------------------------------------------
     if (!o.out.empty()) {
@@ -532,7 +694,10 @@ int main(int argc, char **argv) {
         throw std::runtime_error("cannot write --out file: " + o.out);
       out << "query_idx,latency_us,requested_bytes,useful_bytes,wasted_bytes,"
              "read_ops,header_reads,dependent_reads,zero_degree_layers,"
-             "failed_reads,node_bytes,layer_reads,degree_sum,capacity_sum\n";
+             "failed_reads,node_bytes,layer_reads,degree_sum,capacity_sum,"
+             "cache_hits,cache_misses,cache_invalidations,cache_evictions,"
+             "cache_updates,hint_reads,cold_start_reads,fallbacks,"
+             "fallback_bytes,hint_slots_sum,over_read_slots_sum\n";
       for (std::size_t i = 0; i < samples.size(); ++i) {
         const auto &s = samples[i];
         out << i << ',' << s.latency_us << ',' << s.m.requested_bytes << ','
@@ -541,7 +706,12 @@ int main(int argc, char **argv) {
             << s.m.dependent_reads << ',' << s.m.zero_degree_layers << ','
             << s.m.failed_reads << ',' << s.m.node_bytes << ','
             << s.m.layer_reads << ',' << s.m.degree_sum << ','
-            << s.m.capacity_sum << '\n';
+            << s.m.capacity_sum << ',' << s.m.cache_hits << ','
+            << s.m.cache_misses << ',' << s.m.cache_invalidations << ','
+            << s.m.cache_evictions << ',' << s.m.cache_updates << ','
+            << s.m.hint_reads << ',' << s.m.cold_start_reads << ','
+            << s.m.fallbacks << ',' << s.m.fallback_bytes << ','
+            << s.m.hint_slots_sum << ',' << s.m.over_read_slots_sum << '\n';
       }
     }
 
@@ -560,7 +730,14 @@ int main(int argc, char **argv) {
                "useful_bytes,wasted_bytes,waste_ratio,node_bytes,"
                "neighbor_share,read_ops,layer_reads,header_reads,"
                "dependent_reads,zero_degree_layers,failed_reads,"
-               "capacity_utilization,avg_degree,recall\n";
+               "capacity_utilization,avg_degree,recall,"
+               "cache_capacity,prefix_granularity,update_distribution,"
+               "update_hot_size,hint_reads,cold_start_reads,cache_hits,"
+               "cache_misses,cache_invalidations,cache_evictions,cache_updates,"
+               "hit_rate,miss_rate,underestimate_rate_q,overestimate_rate,"
+               "fallbacks,fallback_bytes,hint_slots_sum,over_read_slots_sum,"
+               "avg_hint,total_read_ops,cache_hits_by_level,"
+               "cache_misses_by_level,node_reads\n";
       const auto end_nodes = node.query_engine().catalog().header.node_count;
       out << strategy_label(o.policy) << ',' << csv_escape(o.dataset) << ','
           << csv_escape(o.label) << ',' << dim << ',' << start_nodes << ','
@@ -575,7 +752,20 @@ int main(int argc, char **argv) {
           << neighbor_share << ',' << totals.read_ops << ',' << totals.layer_reads
           << ',' << totals.header_reads << ',' << totals.dependent_reads << ','
           << totals.zero_degree_layers << ',' << totals.failed_reads << ','
-          << cap_util << ',' << avg_degree << ',' << recall << '\n';
+          << cap_util << ',' << avg_degree << ',' << recall << ','
+          << o.cache_capacity << ',' << o.prefix_granularity << ','
+          << o.update_distribution << ',' << hot_size << ','
+          << totals.hint_reads << ',' << totals.cold_start_reads << ','
+          << totals.cache_hits << ',' << totals.cache_misses << ','
+          << totals.cache_invalidations << ',' << totals.cache_evictions << ','
+          << totals.cache_updates << ',' << hit_rate << ',' << miss_rate << ','
+          << underestimate_rate_q << ',' << overestimate_rate << ','
+          << totals.fallbacks << ',' << totals.fallback_bytes << ','
+          << totals.hint_slots_sum << ',' << totals.over_read_slots_sum << ','
+          << avg_hint << ',' << total_read_ops << ','
+          << csv_escape(format_levels(totals.cache_hits_by_level)) << ','
+          << csv_escape(format_levels(totals.cache_misses_by_level)) << ','
+          << totals.node_reads << '\n';
     }
 
     // --- stdout summary ----------------------------------------------------
@@ -604,7 +794,22 @@ int main(int argc, char **argv) {
               << " zero_degree_layers=" << totals.zero_degree_layers << '\n'
               << "capacity_utilization=" << cap_util
               << " avg_degree=" << avg_degree << " recall=" << recall
-              << " wall_s=" << wall_s << '\n';
+              << " wall_s=" << wall_s << '\n'
+              << "hit_rate=" << hit_rate << " miss_rate=" << miss_rate
+              << " q=" << underestimate_rate_q
+              << " overestimate_rate=" << overestimate_rate
+              << " cache_hits=" << totals.cache_hits
+              << " cache_misses=" << totals.cache_misses
+              << " cache_invalidations=" << totals.cache_invalidations
+              << " cache_evictions=" << totals.cache_evictions
+              << " cache_updates=" << totals.cache_updates
+              << " hint_reads=" << totals.hint_reads
+              << " cold_start_reads=" << totals.cold_start_reads
+              << " fallbacks=" << totals.fallbacks
+              << " fallback_bytes=" << totals.fallback_bytes
+              << " hint_slots_sum=" << totals.hint_slots_sum
+              << " over_read_slots_sum=" << totals.over_read_slots_sum
+              << " avg_hint=" << avg_hint << '\n';
     if (totals.requested != totals.useful + totals.wasted)
       throw std::runtime_error(
           "neighbor byte identity violated: requested != useful + wasted");
@@ -613,6 +818,35 @@ int main(int argc, char **argv) {
       throw std::runtime_error(
           "Baseline 2 identity violated: read_ops != header_reads + "
           "dependent_reads");
+    if (o.policy == rh::ReadPolicy::CachedLength) {
+      // docs/baseline3-plan.md section 7.4.  Identities (4)-(7) assume no
+      // failed transport read, which is always the case in a healthy run.
+      if (totals.failed_reads != 0)
+        throw std::runtime_error("Baseline 3: unexpected failed reads");
+      if (totals.read_ops !=
+          totals.hint_reads + totals.header_reads + totals.dependent_reads)
+        throw std::runtime_error(
+            "Baseline 3 identity 2 violated: read_ops != hint+header+dependent");
+      if (totals.cache_hits != totals.hint_reads)
+        throw std::runtime_error(
+            "Baseline 3 identity 3 violated: cache_hits != hint_reads");
+      if (totals.cache_hits + totals.cache_misses != totals.layer_reads)
+        throw std::runtime_error("Baseline 3 identity 4 violated: hits+misses "
+                                 "!= layer_reads");
+      if (totals.cache_misses != totals.header_reads)
+        throw std::runtime_error(
+            "Baseline 3 identity 5 violated: cache_misses != header_reads");
+      if (totals.fallbacks != totals.cache_invalidations)
+        throw std::runtime_error(
+            "Baseline 3 identity 6 violated: fallbacks != invalidations");
+      if (totals.dependent_reads !=
+          totals.fallbacks + totals.cold_start_reads)
+        throw std::runtime_error("Baseline 3 identity 7 violated: dependent "
+                                 "!= fallbacks + cold_start");
+      if (totals.wasted != sizeof(rh::NodeId) * totals.over_read_slots_sum)
+        throw std::runtime_error(
+            "Baseline 3 identity 8 violated: wasted != 4*over_read_slots_sum");
+    }
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "baseline1_experiment: " << e.what() << '\n';

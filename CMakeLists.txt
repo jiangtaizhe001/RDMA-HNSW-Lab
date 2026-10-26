@@ -122,12 +122,16 @@ if(BUILD_TESTING)
   target_link_libraries(graph_store_test PRIVATE rdma_hnsw_core)
   add_executable(read_strategy_test tests/read_strategy_test.cc)
   target_link_libraries(read_strategy_test PRIVATE rdma_hnsw_core)
+  # Baseline 3 (compute-side degree cache): states, identities, cache lifetime.
+  add_executable(read_strategy_cached_test tests/read_strategy_cached_test.cc)
+  target_link_libraries(read_strategy_cached_test PRIVATE rdma_hnsw_core)
   add_executable(hnsw_builder_test tests/hnsw_builder_test.cc)
   target_link_libraries(hnsw_builder_test PRIVATE rdma_hnsw_core)
   add_executable(runtime_api_test tests/runtime_api_test.cc)
   target_link_libraries(runtime_api_test PRIVATE rdma_hnsw)
   add_test(NAME graph_store_test COMMAND graph_store_test)
   add_test(NAME read_strategy_test COMMAND read_strategy_test)
+  add_test(NAME read_strategy_cached_test COMMAND read_strategy_cached_test)
   add_test(NAME hnsw_builder_test COMMAND hnsw_builder_test)
   add_test(NAME runtime_api_test COMMAND runtime_api_test)
   # Baseline 1 experiment smoke test: build a tiny index on the fly, run a few
@@ -143,9 +147,19 @@ if(BUILD_TESTING)
                    --index ${CMAKE_BINARY_DIR}/baseline2_smoke.bin
                    --out ${CMAKE_BINARY_DIR}/baseline2_smoke.csv
                    --summary-out ${CMAKE_BINARY_DIR}/baseline2_smoke_summary.csv)
+  # Baseline 3 (cached_length) smoke test: a small cache forces real evictions,
+  # and the run asserts the eight Baseline 3 identities.
+  add_test(NAME baseline3_experiment_smoke
+           COMMAND baseline1_experiment --smoke --read-strategy cached_length
+                   --cache-capacity 1000
+                   --index ${CMAKE_BINARY_DIR}/baseline3_smoke.bin
+                   --out ${CMAKE_BINARY_DIR}/baseline3_smoke.csv
+                   --summary-out ${CMAKE_BINARY_DIR}/baseline3_smoke_summary.csv)
   # Existing tests use assert(), including operations inside the assertions.
   # Keep them active when students use the default Release build.
-  foreach(test_target cm_protocol_test graph_store_test read_strategy_test hnsw_builder_test runtime_api_test)
+  foreach(test_target cm_protocol_test graph_store_test read_strategy_test
+                      read_strategy_cached_test hnsw_builder_test
+                      runtime_api_test)
     target_compile_options(${test_target} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
   endforeach()
 endif()
