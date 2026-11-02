@@ -62,6 +62,11 @@ struct Options {
   std::string read_strategy = "baseline1";
   std::string dataset = "synthetic";
   std::string distance = "l2";
+  std::string ib_device;
+  std::string rdma_connection = "ib";
+  std::string updates_out;
+  std::size_t ib_port = 1;
+  std::size_t rdma_timeout_ms = 10000;
   std::size_t port = 18515;
   std::size_t query_count = 1000;
   std::size_t update_count = 0;
@@ -127,6 +132,9 @@ void print_usage() {
       << "  --index FILE               index to query\n"
       << "  --transport mmap|rdma      transport backend (default mmap)\n"
       << "  --host HOST --port N       RDMA control endpoint\n"
+      << "  --ib-device NAME --ib-port N  RDMA device and port (e.g. mlx5_0 1)\n"
+      << "  --rdma-connection ib|cm    IB LID (default) or RDMA CM\n"
+      << "  --rdma-timeout-ms N        CM handshake/operation deadline (10000)\n"
       << "  --queries FILE             query vectors (.fvecs)\n"
       << "  --queries-count N          synthetic queries when --queries is absent\n"
       << "  --base FILE                base vectors for exact recall\n"
@@ -139,6 +147,7 @@ void print_usage() {
       << "  --update-ratio R           fraction of queries followed by an update\n"
       << "  --warmup N                 warm-up queries excluded from samples\n"
       << "  --out FILE                 per-query CSV output\n"
+      << "  --updates-out FILE         per-update latency CSV output\n"
       << "  --summary-out FILE         append a one-row summary CSV\n"
       << "  --dataset --label NAME     labels recorded in the summary\n"
       << "  --dim N --M N --seed N     synthetic data / smoke parameters\n"
@@ -175,6 +184,8 @@ Options parse(int argc, char **argv) {
       o.out = next_value(i, argc, argv);
     else if (a == "--summary-out")
       o.summary_out = next_value(i, argc, argv);
+    else if (a == "--updates-out")
+      o.updates_out = next_value(i, argc, argv);
     else if (a == "--queries")
       o.queries = next_value(i, argc, argv);
     else if (a == "--base")
@@ -191,6 +202,14 @@ Options parse(int argc, char **argv) {
       o.transport = next_value(i, argc, argv);
     else if (a == "--host")
       o.host = next_value(i, argc, argv);
+    else if (a == "--ib-device")
+      o.ib_device = next_value(i, argc, argv);
+    else if (a == "--ib-port")
+      o.ib_port = as_size(next_value(i, argc, argv));
+    else if (a == "--rdma-connection")
+      o.rdma_connection = next_value(i, argc, argv);
+    else if (a == "--rdma-timeout-ms")
+      o.rdma_timeout_ms = as_size(next_value(i, argc, argv));
     else if (a == "--port")
       o.port = as_size(next_value(i, argc, argv));
     else if (a == "--distance")
@@ -236,6 +255,12 @@ Options parse(int argc, char **argv) {
   }
   if (o.transport != "mmap" && o.transport != "rdma")
     throw std::invalid_argument("transport must be mmap or rdma");
+  if (o.rdma_connection != "ib" && o.rdma_connection != "cm")
+    throw std::invalid_argument("rdma-connection must be ib or cm");
+  if (o.ib_port == 0 || o.ib_port > 255)
+    throw std::invalid_argument("ib-port must be within 1..255");
+  if (o.rdma_timeout_ms == 0 || o.rdma_timeout_ms > 600000)
+    throw std::invalid_argument("rdma-timeout-ms must be within 1..600000");
   if (o.update_op != "none" && o.update_op != "insert" &&
       o.update_op != "upsert" && o.update_op != "erase")
     throw std::invalid_argument("update-op must be none, insert, upsert or erase");
@@ -353,9 +378,34 @@ rh::ReadMetrics diff_metrics(const rh::ReadMetrics &a, const rh::ReadMetrics &b)
   return d;
 }
 
+struct TransportSnapshot {
+  std::uint64_t read_ops{};
+  std::uint64_t write_ops{};
+  std::uint64_t read_bytes{};
+  std::uint64_t write_bytes{};
+};
+
+TransportSnapshot snapshot_transport(const rh::RemoteTransport &t) {
+  const auto &s = t.stats();
+  return {s.read_ops.load(), s.write_ops.load(), s.read_bytes.load(),
+          s.write_bytes.load()};
+}
+
 struct Sample {
   double latency_us{};
   rh::ReadMetrics m;
+  std::uint64_t transport_read_ops{};
+  std::uint64_t transport_write_ops{};
+  std::uint64_t transport_read_bytes{};
+  std::uint64_t transport_write_bytes{};
+};
+
+struct UpdateSample {
+  std::size_t index{};
+  double latency_us{};
+  bool ok{false};
+  rh::Generation generation{};
+  std::string error;
 };
 
 double percentile(std::vector<double> v, double p) {
@@ -374,6 +424,9 @@ struct Totals {
   std::uint64_t requested{}, useful{}, wasted{}, read_ops{}, header_reads{},
       dependent_reads{}, zero_degree_layers{}, failed_reads{}, node_reads{},
       node_bytes{}, layer_reads{}, degree_sum{}, capacity_sum{};
+  // Transport-level counters (RDMA READ/WRITE actually issued).
+  std::uint64_t transport_read_ops{}, transport_write_ops{},
+      transport_read_bytes{}, transport_write_bytes{};
   // Baseline 3 counters.
   std::uint64_t cache_hits{}, cache_misses{}, cache_invalidations{},
       fallbacks{}, hint_reads{}, cold_start_reads{}, fallback_bytes{},
@@ -418,6 +471,13 @@ void add(Totals &t, const rh::ReadMetrics &m) {
   t.over_read_slots_sum += m.over_read_slots_sum;
   add_levels(t.cache_hits_by_level, m.cache_hits_by_level);
   add_levels(t.cache_misses_by_level, m.cache_misses_by_level);
+}
+
+void add_transport(Totals &t, const Sample &s) {
+  t.transport_read_ops += s.transport_read_ops;
+  t.transport_write_ops += s.transport_write_ops;
+  t.transport_read_bytes += s.transport_read_bytes;
+  t.transport_write_bytes += s.transport_write_bytes;
 }
 
 std::string csv_escape(const std::string &s) {
@@ -475,6 +535,11 @@ int main(int argc, char **argv) {
                                           : rh::TransportKind::Mmap;
     cfg.host = o.host;
     cfg.port = o.port;
+    cfg.ib_device = o.ib_device;
+    cfg.ib_port = o.ib_port;
+    cfg.rdma_connection = o.rdma_connection == "cm" ? rh::RdmaConnection::Cm
+                                                     : rh::RdmaConnection::Ib;
+    cfg.rdma_timeout_ms = o.rdma_timeout_ms;
     cfg.read_policy = o.policy;
     cfg.distance = inner ? rh::DistanceKind::InnerProduct : rh::DistanceKind::L2;
     cfg.ef_search = o.ef_search;
@@ -572,25 +637,38 @@ int main(int argc, char **argv) {
     // --- measured loop -----------------------------------------------------
     std::vector<Sample> samples;
     samples.reserve(queries.size());
+    std::vector<UpdateSample> update_samples;
+    update_samples.reserve(updates.size());
     Totals totals;
     double recall_sum = 0.0;
     std::uint64_t recall_queries = 0;
     std::uint64_t updates_applied = 0;
+    std::uint64_t update_failures = 0;
 
     const auto loop_start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < queries.size(); ++i) {
       const rh::ReadMetrics before = node.query_engine().stats().reads;
+      const auto transport_before = snapshot_transport(node.transport());
       const auto t0 = std::chrono::steady_clock::now();
       const auto ids = node.query(queries[i]);
       const auto t1 = std::chrono::steady_clock::now();
       const rh::ReadMetrics after = node.query_engine().stats().reads;
+      const auto transport_after = snapshot_transport(node.transport());
 
       Sample s;
       s.latency_us =
           std::chrono::duration<double, std::micro>(t1 - t0).count();
       s.m = diff_metrics(after, before);
+      s.transport_read_ops = transport_after.read_ops - transport_before.read_ops;
+      s.transport_write_ops =
+          transport_after.write_ops - transport_before.write_ops;
+      s.transport_read_bytes =
+          transport_after.read_bytes - transport_before.read_bytes;
+      s.transport_write_bytes =
+          transport_after.write_bytes - transport_before.write_bytes;
       samples.push_back(s);
       add(totals, s.m);
+      add_transport(totals, s);
 
       // Recall: exact recall if a base is given, else precomputed ground truth.
       if (!base.empty() || !gt.empty()) {
@@ -615,12 +693,24 @@ int main(int argc, char **argv) {
           const rh::UpdateRequest req{
               update_code, id,
               update_code == rh::update_op::Erase ? rh::Vector{} : updates[ui % updates.size()]};
+          const auto u0 = std::chrono::steady_clock::now();
           const auto r = node.update(req);
+          const auto u1 = std::chrono::steady_clock::now();
+          UpdateSample us;
+          us.index = ui;
+          us.latency_us =
+              std::chrono::duration<double, std::micro>(u1 - u0).count();
+          us.ok = r.ok;
+          us.generation = r.generation;
+          us.error = r.error;
+          update_samples.push_back(std::move(us));
           if (r.ok) {
             ++updates_applied;
             // reload() rebuilt the engine; re-install the configured strategy.
             // For B3 the shared LengthCache keeps the learned degrees alive.
             inject();
+          } else {
+            ++update_failures;
           }
         }
       }
@@ -667,6 +757,15 @@ int main(int argc, char **argv) {
             : 0.0;
     const double recall =
         recall_queries ? recall_sum / recall_queries : 0.0;
+    std::vector<double> update_lat;
+    update_lat.reserve(update_samples.size());
+    for (const auto &u : update_samples)
+      update_lat.push_back(u.latency_us);
+    const double update_mean_us =
+        update_lat.empty()
+            ? 0.0
+            : std::accumulate(update_lat.begin(), update_lat.end(), 0.0) /
+                  static_cast<double>(update_lat.size());
     // Baseline 3 aggregates (docs/baseline3-plan.md section 7.2).
     const std::uint64_t lookups = totals.cache_hits + totals.cache_misses;
     const double hit_rate =
@@ -697,7 +796,9 @@ int main(int argc, char **argv) {
              "failed_reads,node_bytes,layer_reads,degree_sum,capacity_sum,"
              "cache_hits,cache_misses,cache_invalidations,cache_evictions,"
              "cache_updates,hint_reads,cold_start_reads,fallbacks,"
-             "fallback_bytes,hint_slots_sum,over_read_slots_sum\n";
+             "fallback_bytes,hint_slots_sum,over_read_slots_sum,"
+             "transport_read_ops,transport_write_ops,transport_read_bytes,"
+             "transport_write_bytes\n";
       for (std::size_t i = 0; i < samples.size(); ++i) {
         const auto &s = samples[i];
         out << i << ',' << s.latency_us << ',' << s.m.requested_bytes << ','
@@ -711,8 +812,23 @@ int main(int argc, char **argv) {
             << s.m.cache_evictions << ',' << s.m.cache_updates << ','
             << s.m.hint_reads << ',' << s.m.cold_start_reads << ','
             << s.m.fallbacks << ',' << s.m.fallback_bytes << ','
-            << s.m.hint_slots_sum << ',' << s.m.over_read_slots_sum << '\n';
+            << s.m.hint_slots_sum << ',' << s.m.over_read_slots_sum << ','
+            << s.transport_read_ops << ',' << s.transport_write_ops << ','
+            << s.transport_read_bytes << ',' << s.transport_write_bytes
+            << '\n';
       }
+    }
+
+    // --- CSV: per-update samples ------------------------------------------
+    if (!o.updates_out.empty()) {
+      std::ofstream out(o.updates_out, std::ios::trunc);
+      if (!out)
+        throw std::runtime_error("cannot write --updates-out file: " +
+                                 o.updates_out);
+      out << "update_idx,latency_us,ok,generation,error\n";
+      for (const auto &u : update_samples)
+        out << u.index << ',' << u.latency_us << ',' << (u.ok ? 1 : 0) << ','
+            << u.generation << ',' << csv_escape(u.error) << '\n';
     }
 
     // --- CSV: one summary row ---------------------------------------------
@@ -737,7 +853,11 @@ int main(int argc, char **argv) {
                "hit_rate,miss_rate,underestimate_rate_q,overestimate_rate,"
                "fallbacks,fallback_bytes,hint_slots_sum,over_read_slots_sum,"
                "avg_hint,total_read_ops,cache_hits_by_level,"
-               "cache_misses_by_level,node_reads\n";
+               "cache_misses_by_level,node_reads,transport_read_ops,"
+               "transport_write_ops,transport_read_bytes,"
+               "transport_write_bytes,update_failures,update_latency_mean_us,"
+               "update_latency_p50_us,update_latency_p95_us,"
+               "update_latency_p99_us\n";
       const auto end_nodes = node.query_engine().catalog().header.node_count;
       out << strategy_label(o.policy) << ',' << csv_escape(o.dataset) << ','
           << csv_escape(o.label) << ',' << dim << ',' << start_nodes << ','
@@ -765,7 +885,12 @@ int main(int argc, char **argv) {
           << avg_hint << ',' << total_read_ops << ','
           << csv_escape(format_levels(totals.cache_hits_by_level)) << ','
           << csv_escape(format_levels(totals.cache_misses_by_level)) << ','
-          << totals.node_reads << '\n';
+          << totals.node_reads << ',' << totals.transport_read_ops << ','
+          << totals.transport_write_ops << ',' << totals.transport_read_bytes
+          << ',' << totals.transport_write_bytes << ',' << update_failures
+          << ',' << update_mean_us << ',' << percentile(update_lat, 0.50)
+          << ',' << percentile(update_lat, 0.95) << ','
+          << percentile(update_lat, 0.99) << '\n';
     }
 
     // --- stdout summary ----------------------------------------------------
@@ -809,7 +934,17 @@ int main(int argc, char **argv) {
               << " fallback_bytes=" << totals.fallback_bytes
               << " hint_slots_sum=" << totals.hint_slots_sum
               << " over_read_slots_sum=" << totals.over_read_slots_sum
-              << " avg_hint=" << avg_hint << '\n';
+              << " avg_hint=" << avg_hint << '\n'
+              << "transport_read_ops=" << totals.transport_read_ops
+              << " transport_write_ops=" << totals.transport_write_ops
+              << " transport_read_bytes=" << totals.transport_read_bytes
+              << " transport_write_bytes=" << totals.transport_write_bytes
+              << " update_failures=" << update_failures
+              << " update_latency_mean_us=" << update_mean_us
+              << " update_latency_p50_us=" << percentile(update_lat, 0.50)
+              << " update_latency_p95_us=" << percentile(update_lat, 0.95)
+              << " update_latency_p99_us=" << percentile(update_lat, 0.99)
+              << '\n';
     if (totals.requested != totals.useful + totals.wasted)
       throw std::runtime_error(
           "neighbor byte identity violated: requested != useful + wasted");
