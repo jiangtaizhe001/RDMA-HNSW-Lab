@@ -82,7 +82,16 @@ def config_rank(row: dict[str, str]) -> tuple[int, int]:
 
 
 def per_query_path(root: Path, row: dict[str, str]) -> Path:
-    return root / "per_query" / f"{row['label']}_{config_key(row)}.csv"
+    name = f"{row['label']}_{config_key(row)}.csv"
+    for directory in (root / "per_query", root / "static" / "per_query",
+                      root / "capacity" / "per_query",
+                      root / "quality" / "per_query",
+                      root / "mixed" / "per_query",
+                      root / "concurrency" / "per_query"):
+        candidate = directory / name
+        if candidate.exists():
+            return candidate
+    return root / "per_query" / name
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -273,11 +282,17 @@ def main() -> int:
         return 1
     print(f"identity validation OK: {len(all_rows)} summary rows")
 
-    md = ["# Quantized-prefix local mmap sweep\n"]
+    md = ["# Quantized-prefix RDMA sweep\n" if any(
+        r.get("transport") == "rdma" for r in all_rows)
+        else "# Quantized-prefix local mmap sweep\n"]
+    transport_note = (
+        "RDMA runs; latency comes from the verbs READ path "
+        "(single-machine HCA loopback in this execution)."
+        if any(r.get("transport") == "rdma" for r in all_rows)
+        else "mmap runs, so latency is not an RDMA measurement.")
     md.append(f"Validated {len(all_rows)} summary rows (schema_version 2). "
               f"Cold window = first {args.cold_split} static queries / "
-              f"{args.mixed_cold_split} mixed queries; these are mmap runs, so "
-              "latency is not an RDMA measurement.\n")
+              f"{args.mixed_cold_split} mixed queries; {transport_note}\n")
 
     static_groups = collect_windows(
         args.root, static_rows, args.cold_split,

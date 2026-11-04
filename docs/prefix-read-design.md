@@ -1,6 +1,6 @@
 # 分级前缀读取机制设计
 
-本文依据 [experiment.md](experiment.md)、[rdma-baseline-report.md](rdma-baseline-report.md)、三个 Baseline 的计划与报告，以及现有策略代码设计。状态：**最小机制已实现并通过正确性门禁；已完成首轮 10K mmap G 扫描（见 [prefix-read-report.md](prefix-read-report.md)），尚无 RDMA 性能测量**。不改变索引格式、HNSW 搜索流程或 RDMA Verbs 接口。
+本文依据 [experiment.md](experiment.md)、[rdma-baseline-report.md](rdma-baseline-report.md)、三个 Baseline 的计划与报告，以及现有策略代码设计。状态：**最小机制已实现并通过正确性门禁；已完成首轮 10K mmap 与 100K RDMA（缩减协议）扫描，结果见 [10K 报告](prefix-read-report.md) 和 [100K 报告](prefix-rdma-100k-report.md)**。不改变索引格式、HNSW 搜索流程或 RDMA Verbs 接口。
 
 ## 1. 实验依据与研究问题
 
@@ -198,7 +198,7 @@ wasted_bytes = rounding_waste_bytes + drift_waste_bytes + cold_prefix_waste_byte
 
 先通过 FakeTransport/小图枚举验证机制，再在现有 10K 数据上做 G 扫描。建议采集只用于离线分析的 `(node,level,C,last_degree,h,d,hit,read_lengths)` 轨迹，计时实验关闭详细 trace。离线回放可预测各 G 的 READ/字节计数，但不能预测真实 RDMA 时延。
 
-首轮 10K mmap G 扫描已按本节流程完成，结果见 [prefix-read-report.md](prefix-read-report.md)；轨迹采集与离线回放仍未实现，RDMA 对比未开始。
+首轮 10K mmap G 扫描已按本节流程完成，结果见 [prefix-read-report.md](prefix-read-report.md)；100K RDMA 缩减协议也已完成，见 [prefix-rdma-100k-report.md](prefix-rdma-100k-report.md)。轨迹采集与离线回放仍未实现。
 
 需有一个可直接证伪的正向例子：G=4，缓存精确 d=21 后增长到 23，B3 应补读、分级不补读；再有 25->32 的反例，G=4 仍补读。静态大缓存下允许观察到分级与 B3 操作数相同、字节更高，不能只保留有利 workload。
 
@@ -245,3 +245,5 @@ wasted_bytes = rounding_waste_bytes + drift_waste_bytes + cold_prefix_waste_byte
 当前 RDMA 结果支持“优化短尾补读值得实验”，不支持“分级必然优于 B3/B1”。最有信息量的下一步是实现固定 G 的最小机制，先验证逐次计数预测，再开展相同 recall、明确快照语义的 RDMA 对比。
 
 首轮 10K mmap 证据（[报告](prefix-read-report.md)第 3–6 节）进一步收紧了结论：静态查询下 G<16 与 B3 操作数相同、G=32 接近 B1 行为；upsert 0.1/0.3/0.5 的 B3 低估只有 0.02–0.03 次/query，分级最多把它降到 0，节省被 14–16 次/query 的冷启动补读和 38–712 B/query 过读淹没。因此固定 G=4 在本数据上不成立；是否继续取决于目标 workload 是否存在“精确 degree 频繁小幅低估”的场景，并需在 RDMA 与更大规模数据上复核。
+
+100K 真实 RDMA（单机 loopback，缩减协议，[报告](prefix-rdma-100k-report.md)第 4–9 节）给出同方向结果：G=1–8 与 B3 的静态 ops/query 相同（93.73，缓存 100000），G=16 只少 2.82 次，G=32 降到 75.04（与 B1 相同）但多 893.8 B/query；混合 0.5 下 B3 为 129.04，G=16 为 122.17，G=32 为 74.51。G=32 是 READ 下限端点，但相对 B1 没有读取模式上的优势；中间 G 没有优于 B3 的证据。

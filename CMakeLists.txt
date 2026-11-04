@@ -27,6 +27,10 @@ target_compile_options(rdma_hnsw_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(hnsw_build src/hnsw_build.cc)
 target_link_libraries(hnsw_build PRIVATE rdma_hnsw_core)
+add_executable(dump_vectors tools/dump_vectors.cc)
+target_link_libraries(dump_vectors PRIVATE rdma_hnsw_core)
+add_executable(check_prefix_index tools/check_prefix_index.cc)
+target_link_libraries(check_prefix_index PRIVATE rdma_hnsw_core)
 add_executable(storage_server src/storage_server.cc)
 add_executable(compute_client src/compute_client.cc)
 
