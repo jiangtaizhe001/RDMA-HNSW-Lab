@@ -125,6 +125,9 @@ if(BUILD_TESTING)
   # Baseline 3 (compute-side degree cache): states, identities, cache lifetime.
   add_executable(read_strategy_cached_test tests/read_strategy_cached_test.cc)
   target_link_libraries(read_strategy_cached_test PRIVATE rdma_hnsw_core)
+  add_executable(read_strategy_prefix_test tests/read_strategy_prefix_test.cc)
+  target_link_libraries(read_strategy_prefix_test PRIVATE rdma_hnsw_core)
+  add_test(NAME read_strategy_prefix_test COMMAND read_strategy_prefix_test)
   add_executable(hnsw_builder_test tests/hnsw_builder_test.cc)
   target_link_libraries(hnsw_builder_test PRIVATE rdma_hnsw_core)
   add_executable(runtime_api_test tests/runtime_api_test.cc)
@@ -157,7 +160,14 @@ if(BUILD_TESTING)
                    --summary-out ${CMAKE_BINARY_DIR}/baseline3_smoke_summary.csv)
   # Existing tests use assert(), including operations inside the assertions.
   # Keep them active when students use the default Release build.
+  add_test(NAME prefix_experiment_smoke
+           COMMAND baseline1_experiment --smoke --read-strategy prefix
+                   --cache-capacity 1000 --prefix-granularity 4
+                   --index ${CMAKE_BINARY_DIR}/prefix_smoke.bin
+                   --out ${CMAKE_BINARY_DIR}/prefix_smoke.csv
+                   --summary-out ${CMAKE_BINARY_DIR}/prefix_smoke_summary.csv)
   foreach(test_target cm_protocol_test graph_store_test read_strategy_test
+                      read_strategy_prefix_test
                       read_strategy_cached_test hnsw_builder_test
                       runtime_api_test)
     target_compile_options(${test_target} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)

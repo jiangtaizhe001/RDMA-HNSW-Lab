@@ -365,6 +365,161 @@ Baseline3CachedLengthStrategy::read(const RemoteNodeView &v, ReadContext &c) {
   return {std::move(out), true, {}};
 }
 
+QuantizedPrefixStrategy::QuantizedPrefixStrategy(SharedPrefixCache cache)
+    : cache_(cache ? std::move(cache) : std::make_shared<PrefixCache>()) {}
+
+NeighborReadResult QuantizedPrefixStrategy::read(const RemoteNodeView &v,
+                                                 ReadContext &c) {
+  auto *metrics = c.metrics;
+  if (metrics)
+    ++metrics->layer_attempts;
+  const auto granularity = c.prefix_granularity;
+  const auto capacity = v.capacity;
+  if (!granularity || !capacity)
+    return {{}, false, "quantized_prefix: zero granularity or capacity"};
+  if (capacity > (std::numeric_limits<std::size_t>::max() - sizeof(std::uint32_t)) /
+                     sizeof(NodeId))
+    return {{}, false, "quantized_prefix: layer size overflow"};
+  const auto layer_bytes = sizeof(std::uint32_t) + capacity * sizeof(NodeId);
+  if (v.layer_offset > c.region_bytes ||
+      layer_bytes > c.region_bytes - v.layer_offset)
+    return {{}, false, "quantized_prefix: layer outside remote region"};
+  if (cache_->granularity != granularity) {
+    cache_->entries.clear();
+    cache_->lru.clear();
+    cache_->granularity = granularity;
+  }
+  const auto key = length_cache_key(v.id, v.level);
+  auto found = cache_->entries.find(key);
+  const bool hit = c.cache_capacity && found != cache_->entries.end();
+  const auto max_level = capacity / granularity + (capacity % granularity != 0);
+  const auto old_level = hit ? found->second.level_hint : 1;
+  if (old_level > max_level)
+    return {{}, false, "quantized_prefix: invalid cached level"};
+  const auto width = old_level > capacity / granularity
+                         ? capacity : old_level * granularity;
+  const auto previous = hit ? found->second.last_degree : 0;
+  if (hit && previous > width)
+    return {{}, false, "quantized_prefix: invalid cached degree"};
+  const auto first_bytes = sizeof(std::uint32_t) + width * sizeof(NodeId);
+  auto transfer = [&](Offset offset, std::vector<byte> &buffer, bool tail) {
+    if (metrics) {
+      ++metrics->read_ops;
+      metrics->requested_bytes += buffer.size();
+    }
+    const auto result = c.transport.read({offset, 0}, buffer);
+    if (metrics) {
+      metrics->received_bytes += result.bytes;
+      if (result.ok && result.bytes == buffer.size())
+        ++metrics->successful_reads;
+      else {
+        ++metrics->failed_reads;
+        if (tail)
+          ++metrics->tail_failures;
+        else
+          ++metrics->prefix_failures;
+      }
+    }
+    return result.ok && result.bytes == buffer.size();
+  };
+  std::vector<byte> first(first_bytes);
+  if (!transfer(v.layer_offset, first, false))
+    return {{}, false, "quantized_prefix: failed or short prefix read"};
+  std::uint32_t degree{};
+  std::memcpy(&degree, first.data(), sizeof(degree));
+  if (degree > capacity) {
+    if (metrics)
+      ++metrics->malformed_degrees;
+    return {{}, false, "quantized_prefix: degree exceeds capacity"};
+  }
+  std::vector<byte> tail;
+  if (degree > width) {
+    tail.resize((degree - width) * sizeof(NodeId));
+    if (!transfer(v.layer_offset + first_bytes, tail, true))
+      return {{}, false, "quantized_prefix: failed or short tail read"};
+  }
+  std::vector<NodeId> neighbors(degree);
+  const auto leading = std::min<std::size_t>(degree, width);
+  if (leading)
+    std::memcpy(neighbors.data(), first.data() + sizeof(degree),
+                leading * sizeof(NodeId));
+  if (!tail.empty())
+    std::memcpy(neighbors.data() + leading, tail.data(), tail.size());
+  if (c.valid_neighbor)
+    for (const auto neighbor : neighbors)
+      if (!c.valid_neighbor(neighbor))
+        return {{}, false, "quantized_prefix: neighbor absent from catalog"};
+
+  const auto new_level = degree / granularity + (degree % granularity != 0);
+  if (metrics) {
+    ++metrics->layer_reads;
+    ++metrics->prefix_reads;
+    metrics->capacity_sum += capacity;
+    metrics->degree_sum += degree;
+    metrics->first_slots_sum += width;
+    metrics->useful_bytes += sizeof(degree) + degree * sizeof(NodeId);
+    const auto waste = width > degree ? (width - degree) * sizeof(NodeId) : 0;
+    metrics->wasted_bytes += waste;
+    if (hit) {
+      ++metrics->cache_hits;
+      bump_level(metrics->cache_hits_by_level, v.level);
+      const auto drift = previous > degree ? (previous - degree) * sizeof(NodeId) : 0;
+      metrics->drift_waste_bytes += drift;
+      metrics->rounding_waste_bytes += waste - drift;
+    } else {
+      ++metrics->cache_misses;
+      bump_level(metrics->cache_misses_by_level, v.level);
+      metrics->cold_prefix_waste_bytes += waste;
+    }
+    if (!degree)
+      ++metrics->zero_degree_layers;
+    if (!tail.empty()) {
+      ++metrics->fallbacks;
+      ++metrics->dependent_reads;
+      metrics->fallback_bytes += tail.size();
+      if (hit) {
+        ++metrics->cached_fallbacks;
+        metrics->cached_fallback_bytes += tail.size();
+      } else {
+        ++metrics->cold_fallbacks;
+        metrics->cold_fallback_bytes += tail.size();
+      }
+    }
+  }
+  if (c.cache_capacity) {
+    if (metrics) {
+      ++metrics->level_updates;
+      bump_level(metrics->level_updates_by_level, v.level);
+      if (hit && new_level > old_level) {
+        ++metrics->level_up;
+        bump_level(metrics->level_up_by_level, v.level);
+      }
+      if (hit && new_level < old_level) {
+        ++metrics->level_down;
+        bump_level(metrics->level_down_by_level, v.level);
+      }
+    }
+    if (hit) {
+      found->second.level_hint = new_level;
+      found->second.last_degree = degree;
+      cache_->lru.splice(cache_->lru.begin(), cache_->lru, found->second.lru_pos);
+    } else {
+      cache_->lru.push_front(key);
+      cache_->entries.emplace(key, PrefixCacheEntry{new_level, degree, cache_->lru.begin()});
+    }
+    while (cache_->entries.size() > c.cache_capacity) {
+      const auto victim = cache_->lru.back();
+      cache_->lru.pop_back();
+      cache_->entries.erase(victim);
+      if (metrics) {
+        ++metrics->cache_evictions;
+        bump_level(metrics->cache_evictions_by_level, static_cast<std::uint32_t>(victim >> 32));
+      }
+    }
+  }
+  return {std::move(neighbors), true, {}};
+}
+
 void ReadMetrics::merge(const ReadMetrics &o) {
   requested_bytes += o.requested_bytes;
   useful_bytes += o.useful_bytes;
@@ -392,6 +547,23 @@ void ReadMetrics::merge(const ReadMetrics &o) {
   cache_updates += o.cache_updates;
   hint_slots_sum += o.hint_slots_sum;
   over_read_slots_sum += o.over_read_slots_sum;
+  layer_attempts += o.layer_attempts;
+  successful_reads += o.successful_reads;
+  received_bytes += o.received_bytes;
+  cached_fallbacks += o.cached_fallbacks;
+  cold_fallbacks += o.cold_fallbacks;
+  cached_fallback_bytes += o.cached_fallback_bytes;
+  cold_fallback_bytes += o.cold_fallback_bytes;
+  first_slots_sum += o.first_slots_sum;
+  rounding_waste_bytes += o.rounding_waste_bytes;
+  drift_waste_bytes += o.drift_waste_bytes;
+  cold_prefix_waste_bytes += o.cold_prefix_waste_bytes;
+  level_updates += o.level_updates;
+  level_up += o.level_up;
+  level_down += o.level_down;
+  malformed_degrees += o.malformed_degrees;
+  prefix_failures += o.prefix_failures;
+  tail_failures += o.tail_failures;
   auto grow_add = [](std::vector<std::uint64_t> &dst,
                      const std::vector<std::uint64_t> &src) {
     if (dst.size() < src.size())
@@ -401,6 +573,10 @@ void ReadMetrics::merge(const ReadMetrics &o) {
   };
   grow_add(cache_hits_by_level, o.cache_hits_by_level);
   grow_add(cache_misses_by_level, o.cache_misses_by_level);
+  grow_add(level_updates_by_level, o.level_updates_by_level);
+  grow_add(level_up_by_level, o.level_up_by_level);
+  grow_add(level_down_by_level, o.level_down_by_level);
+  grow_add(cache_evictions_by_level, o.cache_evictions_by_level);
 }
 
 std::unique_ptr<NeighborReadStrategy> make_read_strategy(ReadPolicy p) {
@@ -412,6 +588,8 @@ std::unique_ptr<NeighborReadStrategy> make_read_strategy(ReadPolicy p) {
   // ReadContext::cache_capacity, so the CLI needs no extra wiring.
   if (p == ReadPolicy::CachedLength)
     return std::make_unique<Baseline3CachedLengthStrategy>();
+  if (p == ReadPolicy::Prefix)
+    return std::make_unique<QuantizedPrefixStrategy>();
   throw std::invalid_argument("read strategy is a student extension; "
                               "implement and inject it before selecting " +
                               to_string(p));

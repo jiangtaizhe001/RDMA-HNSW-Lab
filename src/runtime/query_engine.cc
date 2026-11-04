@@ -29,7 +29,14 @@ QueryEngine::QueryEngine(IndexCatalog catalog, RemoteTransport &t, ReadPolicy p,
     : catalog_(std::move(catalog)), transport_(t),
       strategy_(make_read_strategy(p)),
       context_{transport_, &stats_.reads, g, cap, {}}, ef_search_(ef), k_(k),
-      cache_capacity_(cap), distance_kind_(distance_kind) {}
+      cache_capacity_(cap), distance_kind_(distance_kind) {
+  if (!g)
+    throw std::invalid_argument("prefix granularity must be positive");
+  context_.valid_neighbor = [this](NodeId id) {
+    return id < catalog_.offsets.size() &&
+           catalog_.offsets[id] >= catalog_.header.records_begin;
+  };
+}
 
 void QueryEngine::set_read_strategy(
     std::unique_ptr<NeighborReadStrategy> strategy) {

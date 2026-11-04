@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze the RDMA Baseline 1/2/3 sweep.
+"""Analyze the RDMA Baseline 1/2/3 + quantized-prefix sweep.
 
 Inputs (produced by scripts/run_rdma_baselines.sh):
   out/rdma/static_summary.csv
@@ -38,21 +38,25 @@ STRATEGY_ORDER = [
     "baseline1_fixed",
     "baseline2_header_first",
     "baseline3_cached_length",
+    "quantized_prefix",
 ]
 STRATEGY_LABEL = {
     "baseline1_fixed": "B1 fixed",
     "baseline2_header_first": "B2 header-first",
     "baseline3_cached_length": "B3 cached-length",
+    "quantized_prefix": "QP quantized-prefix",
 }
 STRATEGY_KEY = {
     "baseline1_fixed": "baseline1",
     "baseline2_header_first": "baseline2",
     "baseline3_cached_length": "baseline3",
+    "quantized_prefix": "prefix",
 }
 COLORS = {
     "baseline1_fixed": "#4C72B0",
     "baseline2_header_first": "#DD8452",
     "baseline3_cached_length": "#55A868",
+    "quantized_prefix": "#C44E52",
 }
 
 
@@ -143,6 +147,10 @@ def validate(rows: list[tuple[str, dict[str, str]]]) -> list[str]:
         requested = to_int(r, "requested_bytes")
         useful = to_int(r, "useful_bytes")
         wasted = to_int(r, "wasted_bytes")
+        if "schema_version" in r and to_int(r, "schema_version", -1) != 2:
+            problems.append(
+                f"{source}/{label}/{strategy}: unexpected schema_version "
+                f"{r['schema_version']}")
         if requested != useful + wasted:
             problems.append(
                 f"{source}/{label}/{strategy}: requested {requested} != "
@@ -179,6 +187,50 @@ def validate(rows: list[tuple[str, dict[str, str]]]) -> list[str]:
             if wasted != 4 * to_int(r, "over_read_slots_sum"):
                 problems.append(
                     f"{source}/{label}/{strategy}: wasted != 4*over_read_slots")
+            if read_ops != layer_reads + fallbacks + cold:
+                problems.append(
+                    f"{source}/{label}/{strategy}: cost model read_ops != "
+                    f"layer+fallbacks+cold_start")
+        if strategy == "quantized_prefix":
+            read_ops = to_int(r, "read_ops")
+            layer_reads = to_int(r, "layer_reads")
+            prefix_reads = to_int(r, "prefix_reads")
+            hits = to_int(r, "cache_hits")
+            misses = to_int(r, "cache_misses")
+            fallbacks = to_int(r, "fallbacks")
+            cached = to_int(r, "cached_fallbacks")
+            cold = to_int(r, "cold_fallbacks")
+            if to_int(r, "failed_reads") != 0:
+                problems.append(f"{source}/{label}/{strategy}: failed_reads != 0")
+            if prefix_reads != layer_reads:
+                problems.append(
+                    f"{source}/{label}/{strategy}: prefix_reads != layer_reads")
+            if hits + misses != layer_reads:
+                problems.append(
+                    f"{source}/{label}/{strategy}: hits+misses != layer_reads")
+            if read_ops != prefix_reads + fallbacks:
+                problems.append(
+                    f"{source}/{label}/{strategy}: read_ops != prefix+fallbacks")
+            if to_int(r, "dependent_reads") != fallbacks:
+                problems.append(
+                    f"{source}/{label}/{strategy}: dependent_reads != fallbacks")
+            if fallbacks != cached + cold:
+                problems.append(
+                    f"{source}/{label}/{strategy}: fallbacks != cached+cold")
+            if to_int(r, "fallback_bytes") != (
+                    to_int(r, "cached_fallback_bytes") +
+                    to_int(r, "cold_fallback_bytes")):
+                problems.append(
+                    f"{source}/{label}/{strategy}: fallback byte split mismatch")
+            if wasted != (to_int(r, "rounding_waste_bytes") +
+                          to_int(r, "drift_waste_bytes") +
+                          to_int(r, "cold_prefix_waste_bytes")):
+                problems.append(
+                    f"{source}/{label}/{strategy}: wasted split mismatch")
+            if read_ops != layer_reads + fallbacks:
+                problems.append(
+                    f"{source}/{label}/{strategy}: cost model read_ops != "
+                    f"layer+fallbacks")
         if r.get("transport") == "rdma":
             transport = to_int(r, "transport_read_ops")
             logical = to_int(r, "read_ops") + to_int(r, "node_reads")
@@ -382,24 +434,29 @@ def plot_mixed(mixed_runs: list[Run], fig_dir: Path) -> dict:
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    for op, marker in [("erase", "o"), ("upsert", "s")]:
-        xs, ys = [], []
-        for ratio in ratios:
-            rs = [r for r in groups.get((op, str(ratio)), [])
-                  if r.strategy == "baseline3_cached_length"]
-            if rs:
-                xs.append(ratio)
-                ys.append(statistics.median([to_float(r.row, "hit_rate") for r in rs]))
-        if xs:
-            ax.plot(xs, ys, marker=marker, label=f"B3 {op}")
+    for strategy, sname, style in [
+            ("baseline3_cached_length", "B3", "-"),
+            ("quantized_prefix", "prefix", "--")]:
+        for op, marker in [("erase", "o"), ("upsert", "s")]:
+            xs, ys = [], []
+            for ratio in ratios:
+                rs = [r for r in groups.get((op, str(ratio)), [])
+                      if r.strategy == strategy]
+                if rs:
+                    xs.append(ratio)
+                    ys.append(statistics.median(
+                        [to_float(r.row, "hit_rate") for r in rs]))
+            if xs:
+                ax.plot(xs, ys, marker=marker, linestyle=style,
+                        color=COLORS[strategy], label=f"{sname} {op}")
     ax.set_xlabel("update ratio")
     ax.set_ylabel("cache hit rate")
     ax.set_ylim(0, 1.05)
-    ax.set_title("Baseline 3 length-cache hit rate")
+    ax.set_title("Length-cache hit rate (B3 vs quantized prefix)")
     ax.grid(alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(fig_dir / "mixed_b3_cache.png", dpi=160)
+    fig.savefig(fig_dir / "mixed_cache_hit.png", dpi=160)
     plt.close(fig)
 
     return {"groups": groups, "ratios": ratios}
@@ -514,7 +571,7 @@ def main() -> int:
                       run.row.get("update_ratio", ""))].append(run)
 
     md: list[str] = []
-    md.append("# RDMA Baseline 1/2/3 tables\n")
+    md.append("# RDMA Baseline 1/2/3 and quantized-prefix tables\n")
     md.append(f"Validated {len(raw_rows)} summary rows; warm-up queries "
               f"(query_idx < {args.warmup}) excluded from latency statistics.\n")
 
@@ -544,6 +601,8 @@ def main() -> int:
         ("baseline1_fixed", "baseline2_header_first", "B2 - B1"),
         ("baseline1_fixed", "baseline3_cached_length", "B3 - B1"),
         ("baseline2_header_first", "baseline3_cached_length", "B3 - B2"),
+        ("baseline3_cached_length", "quantized_prefix", "QP - B3"),
+        ("baseline1_fixed", "quantized_prefix", "QP - B1"),
     ]:
         d = paired_delta(runs_by_label, base, other)
         if d:
@@ -575,6 +634,7 @@ def main() -> int:
 
     md.append("## Mixed workload\n")
     ratios = sorted({float(r) for (_, r) in mixed_groups}, key=float)
+    cached_strategies = {"baseline3_cached_length", "quantized_prefix"}
     rows = []
     for op in ["erase", "upsert"]:
         for ratio in ratios:
@@ -584,20 +644,87 @@ def main() -> int:
                 if not rs:
                     continue
                 a = aggregate(rs)[s]
-                row0 = rs[0].row
+                cached = s in cached_strategies
                 rows.append([
                     op, str(ratio), STRATEGY_LABEL[s], fmt(a["qps"], 1),
                     fmt(a["p50_us"], 1), fmt(a["p95_us"], 1),
                     fmt(statistics.median([to_float(r.row, "update_latency_p50_us") for r in rs]), 0),
                     fmt(statistics.median([to_float(r.row, "hit_rate") for r in rs]) * 100, 1)
-                    if s == "baseline3_cached_length" else "-",
+                    if cached else "-",
                     fmt(statistics.median([to_float(r.row, "fallbacks") for r in rs]), 0)
-                    if s == "baseline3_cached_length" else "-",
+                    if cached else "-",
+                    fmt(statistics.median([to_float(r.row, "cold_fallbacks") for r in rs]), 0)
+                    if s == "quantized_prefix" else "-",
                 ])
     md.append(table(["op", "ratio", "strategy", "QPS", "query p50 µs",
-                     "query p95 µs", "update p50 µs", "B3 hit %", "B3 fallbacks"],
-                    rows))
+                     "query p95 µs", "update p50 µs", "cache hit %",
+                     "fallbacks", "cold fallbacks"], rows))
     md.append("")
+
+    prefix_runs = [r for r in static_runs + mixed_runs
+                   if r.strategy == "quantized_prefix"]
+    if prefix_runs:
+        md.append("## Quantized-prefix granularity\n")
+        prefix_groups: dict[tuple[str, str, str, str], list[Run]] = defaultdict(list)
+        for run in prefix_runs:
+            g = run.row.get("prefix_granularity", "")
+            if run.source == "static":
+                key = ("static", "-", "-", g)
+            else:
+                key = ("mixed", run.row.get("update_op", "-"),
+                       run.row.get("update_ratio", "-"), g)
+            prefix_groups[key].append(run)
+
+        def per_query(field: str, rs: list[Run]) -> float:
+            values = [to_int(r.row, field) / max(1, to_int(r.row, "queries"))
+                      for r in rs]
+            return statistics.median(values)
+
+        rows = []
+        for key in sorted(prefix_groups,
+                          key=lambda k: (k[0] != "static", k[1], k[2],
+                                         float(k[3] or 0))):
+            rs = prefix_groups[key]
+            rows.append([
+                key[0], key[1], key[2], key[3],
+                fmt(statistics.median([to_float(r.row, "hit_rate") for r in rs]) * 100, 1),
+                fmt(per_query("cold_fallbacks", rs), 3),
+                fmt(per_query("cached_fallbacks", rs), 3),
+                fmt(per_query("wasted_bytes", rs), 1),
+                fmt(per_query("read_ops", rs), 3),
+                fmt(statistics.median([to_float(r.row, "latency_p50_us") for r in rs]), 1),
+            ])
+        md.append(table(["window", "op", "ratio", "G", "hit %",
+                         "cold fb/query", "cached fb/query", "wasted B/query",
+                         "ops/query", "p50 µs"], rows))
+        md.append("")
+
+    md.append("## Cost-model check (static)\n")
+    rows = []
+    for s in ("baseline3_cached_length", "quantized_prefix"):
+        rs = [r for r in static_runs if r.strategy == s]
+        if not rs:
+            continue
+        predicted, measured = [], []
+        for r in rs:
+            queries = max(1, to_int(r.row, "queries"))
+            extra = to_int(r.row, "fallbacks")
+            if s == "baseline3_cached_length":
+                extra += to_int(r.row, "cold_start_reads")
+            predicted.append(
+                (to_int(r.row, "layer_reads") + extra) / queries)
+            measured.append(to_int(r.row, "read_ops") / queries)
+        rows.append([
+            STRATEGY_LABEL[s], fmt(statistics.median(predicted), 3),
+            fmt(statistics.median(measured), 3),
+            fmt(max(abs(a - b) for a, b in zip(predicted, measured)), 3),
+        ])
+    if rows:
+        md.append("Predicted from the section-4 model, using only layer reads "
+                  "and fallback counts from the same run.\n")
+        md.append(table(["strategy", "predicted ops/query",
+                         "measured ops/query", "max abs error"], rows))
+        md.append("")
 
     md.append("## Concurrency (static)\n")
     conc_dir = root / "concurrency"
@@ -625,7 +752,7 @@ def main() -> int:
     md.append("## Figures\n")
     for name in ["static_latency.png", "static_qps.png", "static_latency_cdf.png",
                  "static_ops_bytes.png", "mixed_query_latency.png",
-                 "mixed_update_latency.png", "mixed_b3_cache.png",
+                 "mixed_update_latency.png", "mixed_cache_hit.png",
                  "concurrency_qps.png"]:
         path = args.out_dir / name
         if path.exists():

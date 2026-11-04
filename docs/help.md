@@ -268,7 +268,7 @@ prefix 3: slot [8, 12)
 7. 用真实 degree 重新计算等级并更新缓存；
 8. 统计首次分级读取的字节、fallback 次数和 fallback 读取字节。
 
-关键点是“缓存等级预测一次读取宽度，预测不足时再 fallback”，而不是根据候选队列逐级决定是否继续读取。它应当以少量向上取整的传输浪费换取更高的缓存命中率和更少的 header 往返。
+关键点是“缓存等级预测一次读取宽度，预测不足时再 fallback”，而不是根据候选队列逐级决定是否继续读取。它用受控但并非始终小于 G 的向上取整传输浪费，换取更少的低估补读；它不提高同容量同 LRU 下的缓存查找命中率，只提高首次 READ 足够率。冷启动没有历史 degree，使用第一级前缀 `min(G, capacity)`；缓存等级为 0 表示上次 degree 为 0，本次只读 degree 字段，若随后增长再补读。
 
 注意：`NeighborReadStrategy::read()` 返回时必须给出完整的邻居集合。第一次分级读取不足时，必须在该函数内完成 fallback，不能把未读取的 slot 伪造为有效邻居。
 
@@ -308,7 +308,7 @@ node.query_engine().set_read_strategy(
     std::make_unique<MyStrategy>());
 ```
 
-命令行解析器中的 `header_actual`、`cached_length` 和 `prefix` 名称只是为实验扩展保留的名称；当前核心库不会自动创建未实现的策略。建议实验程序直接通过 API 注入，避免修改核心工厂。
+`header_actual`、`cached_length` 和 `prefix` 已由 `make_read_strategy()` 实现，可分别通过 `--read-strategy` 选择。`prefix` 用 `--prefix-granularity` 设置固定粒度 G；`cached_length` 与 `prefix` 共用 `--cache-capacity`，容量为 0 表示禁用缓存。实验程序仍可通过 `set_read_strategy()` 注入自定义策略。
 
 ## 10. 指标如何记录
 

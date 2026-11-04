@@ -98,7 +98,7 @@ const char *strategy_label(rh::ReadPolicy p) {
   case rh::ReadPolicy::CachedLength:
     return "baseline3_cached_length";
   case rh::ReadPolicy::Prefix:
-    break;
+    return "quantized_prefix";
   }
   throw std::invalid_argument("no experiment label for this read policy");
 }
@@ -153,11 +153,10 @@ void print_usage() {
       << "  --dim N --M N --seed N     synthetic data / smoke parameters\n"
       << "  --ef-construction N        recorded in the summary (not derivable)\n"
       << "  --read-strategy NAME       fixed|baseline1|header_actual|header|"
-         "cached_length|cached\n"
+         "cached_length|cached|prefix\n"
       << "  --cache-capacity N         length-cache entries (default 100000; "
-         "cached_length only)\n"
-      << "  --prefix-granularity N     prefix granularity G (default 4; reserved "
-         "for the prefix strategy)\n"
+         "cached_length and prefix; 0 disables caching)\n"
+      << "  --prefix-granularity N     positive prefix granularity G (default 4)\n"
       << "  --update-distribution D    roundrobin|random|hot (default roundrobin)\n"
       << "  --update-hot-size K        hot id count for 'hot' (default "
          "node_count/100)\n"
@@ -270,10 +269,14 @@ Options parse(int argc, char **argv) {
     o.policy = rh::ReadPolicy::HeaderActual;
   else if (o.read_strategy == "cached_length" || o.read_strategy == "cached")
     o.policy = rh::ReadPolicy::CachedLength;
+  else if (o.read_strategy == "prefix")
+    o.policy = rh::ReadPolicy::Prefix;
   else
     throw std::invalid_argument(
         "unsupported --read-strategy (use fixed|baseline1|header_actual|header|"
-        "cached_length|cached)");
+        "cached_length|cached|prefix)");
+  if (!o.prefix_granularity)
+    throw std::invalid_argument("prefix granularity must be positive");
   if (o.update_distribution != "roundrobin" &&
       o.update_distribution != "random" && o.update_distribution != "hot")
     throw std::invalid_argument(
@@ -365,6 +368,24 @@ rh::ReadMetrics diff_metrics(const rh::ReadMetrics &a, const rh::ReadMetrics &b)
   d.cache_updates = a.cache_updates - b.cache_updates;
   d.hint_slots_sum = a.hint_slots_sum - b.hint_slots_sum;
   d.over_read_slots_sum = a.over_read_slots_sum - b.over_read_slots_sum;
+  d.prefix_reads = a.prefix_reads - b.prefix_reads;
+  d.layer_attempts = a.layer_attempts - b.layer_attempts;
+  d.successful_reads = a.successful_reads - b.successful_reads;
+  d.received_bytes = a.received_bytes - b.received_bytes;
+  d.cached_fallbacks = a.cached_fallbacks - b.cached_fallbacks;
+  d.cold_fallbacks = a.cold_fallbacks - b.cold_fallbacks;
+  d.cached_fallback_bytes = a.cached_fallback_bytes - b.cached_fallback_bytes;
+  d.cold_fallback_bytes = a.cold_fallback_bytes - b.cold_fallback_bytes;
+  d.first_slots_sum = a.first_slots_sum - b.first_slots_sum;
+  d.rounding_waste_bytes = a.rounding_waste_bytes - b.rounding_waste_bytes;
+  d.drift_waste_bytes = a.drift_waste_bytes - b.drift_waste_bytes;
+  d.cold_prefix_waste_bytes = a.cold_prefix_waste_bytes - b.cold_prefix_waste_bytes;
+  d.level_updates = a.level_updates - b.level_updates;
+  d.level_up = a.level_up - b.level_up;
+  d.level_down = a.level_down - b.level_down;
+  d.malformed_degrees = a.malformed_degrees - b.malformed_degrees;
+  d.prefix_failures = a.prefix_failures - b.prefix_failures;
+  d.tail_failures = a.tail_failures - b.tail_failures;
   auto level_diff = [](const std::vector<std::uint64_t> &x,
                        const std::vector<std::uint64_t> &y) {
     std::vector<std::uint64_t> out(x.size(), 0);
@@ -375,6 +396,10 @@ rh::ReadMetrics diff_metrics(const rh::ReadMetrics &a, const rh::ReadMetrics &b)
   d.cache_hits_by_level = level_diff(a.cache_hits_by_level, b.cache_hits_by_level);
   d.cache_misses_by_level =
       level_diff(a.cache_misses_by_level, b.cache_misses_by_level);
+  d.level_updates_by_level = level_diff(a.level_updates_by_level, b.level_updates_by_level);
+  d.level_up_by_level = level_diff(a.level_up_by_level, b.level_up_by_level);
+  d.level_down_by_level = level_diff(a.level_down_by_level, b.level_down_by_level);
+  d.cache_evictions_by_level = level_diff(a.cache_evictions_by_level, b.cache_evictions_by_level);
   return d;
 }
 
@@ -420,19 +445,22 @@ double percentile(std::vector<double> v, double p) {
   return v[lo] + (v[hi] - v[lo]) * (idx - static_cast<double>(lo));
 }
 
-struct Totals {
-  std::uint64_t requested{}, useful{}, wasted{}, read_ops{}, header_reads{},
-      dependent_reads{}, zero_degree_layers{}, failed_reads{}, node_reads{},
-      node_bytes{}, layer_reads{}, degree_sum{}, capacity_sum{};
+void write_prefix_metrics(std::ostream &out, const rh::ReadMetrics &metrics) {
+  out << ",2," << metrics.prefix_reads << ',' << metrics.layer_attempts << ','
+      << metrics.successful_reads << ',' << metrics.received_bytes << ','
+      << metrics.cached_fallbacks << ',' << metrics.cold_fallbacks << ','
+      << metrics.cached_fallback_bytes << ',' << metrics.cold_fallback_bytes << ','
+      << metrics.first_slots_sum << ',' << metrics.rounding_waste_bytes << ','
+      << metrics.drift_waste_bytes << ',' << metrics.cold_prefix_waste_bytes << ','
+      << metrics.level_updates << ',' << metrics.level_up << ',' << metrics.level_down << ','
+      << metrics.malformed_degrees << ',' << metrics.prefix_failures << ',' << metrics.tail_failures;
+}
+
+struct Totals : rh::ReadMetrics {
+  std::uint64_t requested{}, useful{}, wasted{};
   // Transport-level counters (RDMA READ/WRITE actually issued).
   std::uint64_t transport_read_ops{}, transport_write_ops{},
       transport_read_bytes{}, transport_write_bytes{};
-  // Baseline 3 counters.
-  std::uint64_t cache_hits{}, cache_misses{}, cache_invalidations{},
-      fallbacks{}, hint_reads{}, cold_start_reads{}, fallback_bytes{},
-      cache_evictions{}, hint_overestimates{}, cache_updates{},
-      hint_slots_sum{}, over_read_slots_sum{};
-  std::vector<std::uint64_t> cache_hits_by_level, cache_misses_by_level;
 };
 
 void add_levels(std::vector<std::uint64_t> &dst,
@@ -444,33 +472,10 @@ void add_levels(std::vector<std::uint64_t> &dst,
 }
 
 void add(Totals &t, const rh::ReadMetrics &m) {
+  t.merge(m);
   t.requested += m.requested_bytes;
   t.useful += m.useful_bytes;
   t.wasted += m.wasted_bytes;
-  t.read_ops += m.read_ops;
-  t.header_reads += m.header_reads;
-  t.dependent_reads += m.dependent_reads;
-  t.zero_degree_layers += m.zero_degree_layers;
-  t.failed_reads += m.failed_reads;
-  t.node_reads += m.node_reads;
-  t.node_bytes += m.node_bytes;
-  t.layer_reads += m.layer_reads;
-  t.degree_sum += m.degree_sum;
-  t.capacity_sum += m.capacity_sum;
-  t.cache_hits += m.cache_hits;
-  t.cache_misses += m.cache_misses;
-  t.cache_invalidations += m.cache_invalidations;
-  t.fallbacks += m.fallbacks;
-  t.hint_reads += m.hint_reads;
-  t.cold_start_reads += m.cold_start_reads;
-  t.fallback_bytes += m.fallback_bytes;
-  t.cache_evictions += m.cache_evictions;
-  t.hint_overestimates += m.hint_overestimates;
-  t.cache_updates += m.cache_updates;
-  t.hint_slots_sum += m.hint_slots_sum;
-  t.over_read_slots_sum += m.over_read_slots_sum;
-  add_levels(t.cache_hits_by_level, m.cache_hits_by_level);
-  add_levels(t.cache_misses_by_level, m.cache_misses_by_level);
 }
 
 void add_transport(Totals &t, const Sample &s) {
@@ -545,7 +550,7 @@ int main(int argc, char **argv) {
     cfg.ef_search = o.ef_search;
     cfg.k = o.k;
     cfg.cache_capacity = o.cache_capacity;         // load-bearing for B3
-    cfg.prefix_granularity = o.prefix_granularity; // reserved for B4
+    cfg.prefix_granularity = o.prefix_granularity;
 
     rh::ComputeNode node(cfg);
     // The length cache is owned by the experiment, not by the strategy: in mmap
@@ -553,13 +558,17 @@ int main(int argc, char **argv) {
     // set_read_strategy() clears ReadContext::length_cache, so a strategy-owned
     // cache would be wiped on every update (docs/baseline3-plan.md section 0②).
     rh::SharedLengthCache length_cache = std::make_shared<rh::LengthCache>();
+    rh::SharedPrefixCache prefix_cache = std::make_shared<rh::PrefixCache>();
     // Re-install the configured strategy through the same factory the CLI uses,
     // so the experiment can never drift from the production wiring.
-    auto inject = [&node, &o, &length_cache] {
+    auto inject = [&node, &o, &length_cache, &prefix_cache] {
       if (o.policy == rh::ReadPolicy::CachedLength)
         node.query_engine().set_read_strategy(
             std::make_unique<rh::Baseline3CachedLengthStrategy>(
                 o.cache_capacity, length_cache));
+      else if (o.policy == rh::ReadPolicy::Prefix)
+        node.query_engine().set_read_strategy(
+            std::make_unique<rh::QuantizedPrefixStrategy>(prefix_cache));
       else
         node.query_engine().set_read_strategy(
             rh::make_read_strategy(o.policy));
@@ -798,7 +807,12 @@ int main(int argc, char **argv) {
              "cache_updates,hint_reads,cold_start_reads,fallbacks,"
              "fallback_bytes,hint_slots_sum,over_read_slots_sum,"
              "transport_read_ops,transport_write_ops,transport_read_bytes,"
-             "transport_write_bytes\n";
+                  "transport_write_bytes";
+                out << ",schema_version,prefix_reads,layer_attempts,successful_reads,received_bytes,"
+               "cached_fallbacks,cold_fallbacks,cached_fallback_bytes,cold_fallback_bytes,"
+               "first_slots_sum,rounding_waste_bytes,drift_waste_bytes,cold_prefix_waste_bytes,"
+               "level_updates,level_up,level_down,malformed_degrees,prefix_failures,tail_failures";
+                out << '\n';
       for (std::size_t i = 0; i < samples.size(); ++i) {
         const auto &s = samples[i];
         out << i << ',' << s.latency_us << ',' << s.m.requested_bytes << ','
@@ -814,8 +828,9 @@ int main(int argc, char **argv) {
             << s.m.fallbacks << ',' << s.m.fallback_bytes << ','
             << s.m.hint_slots_sum << ',' << s.m.over_read_slots_sum << ','
             << s.transport_read_ops << ',' << s.transport_write_ops << ','
-            << s.transport_read_bytes << ',' << s.transport_write_bytes
-            << '\n';
+            << s.transport_read_bytes << ',' << s.transport_write_bytes;
+        write_prefix_metrics(out, s.m);
+        out << '\n';
       }
     }
 
@@ -838,7 +853,7 @@ int main(int argc, char **argv) {
       if (!out)
         throw std::runtime_error("cannot write --summary-out file: " +
                                  o.summary_out);
-      if (fresh)
+      if (fresh) {
         out << "strategy,dataset,label,dim,node_count_start,node_count_end,M,"
                "ef_construction,ef_search,k,transport,update_op,update_ratio,"
                "queries,updates,qps,qps_end_to_end,wall_s,latency_mean_us,"
@@ -857,7 +872,13 @@ int main(int argc, char **argv) {
                "transport_write_ops,transport_read_bytes,"
                "transport_write_bytes,update_failures,update_latency_mean_us,"
                "update_latency_p50_us,update_latency_p95_us,"
-               "update_latency_p99_us\n";
+               "update_latency_p99_us";
+        out << ",schema_version,prefix_reads,layer_attempts,successful_reads,received_bytes,"
+                 "cached_fallbacks,cold_fallbacks,cached_fallback_bytes,cold_fallback_bytes,"
+                 "first_slots_sum,rounding_waste_bytes,drift_waste_bytes,cold_prefix_waste_bytes,"
+                 "level_updates,level_up,level_down,malformed_degrees,prefix_failures,tail_failures";
+        out << '\n';
+      }
       const auto end_nodes = node.query_engine().catalog().header.node_count;
       out << strategy_label(o.policy) << ',' << csv_escape(o.dataset) << ','
           << csv_escape(o.label) << ',' << dim << ',' << start_nodes << ','
@@ -890,7 +911,9 @@ int main(int argc, char **argv) {
           << ',' << totals.transport_write_bytes << ',' << update_failures
           << ',' << update_mean_us << ',' << percentile(update_lat, 0.50)
           << ',' << percentile(update_lat, 0.95) << ','
-          << percentile(update_lat, 0.99) << '\n';
+          << percentile(update_lat, 0.99);
+      write_prefix_metrics(out, totals);
+      out << '\n';
     }
 
     // --- stdout summary ----------------------------------------------------
@@ -899,6 +922,9 @@ int main(int argc, char **argv) {
               << " ef_search=" << o.ef_search << " k=" << o.k
               << " update_op=" << o.update_op
               << " update_ratio=" << o.update_ratio << '\n'
+              << "prefix_granularity=" << o.prefix_granularity
+              << " cache_capacity=" << o.cache_capacity
+              << " cache_disabled=" << (o.cache_capacity == 0) << '\n'
               << "queries=" << samples.size()
               << " updates=" << updates_applied << " qps=" << qps
               << " qps_end_to_end=" << qps_end_to_end
@@ -953,6 +979,16 @@ int main(int argc, char **argv) {
       throw std::runtime_error(
           "Baseline 2 identity violated: read_ops != header_reads + "
           "dependent_reads");
+    if (o.policy == rh::ReadPolicy::Prefix) {
+      if (totals.failed_reads || totals.prefix_reads != totals.layer_reads ||
+        totals.cache_hits + totals.cache_misses != totals.layer_reads ||
+        totals.fallbacks != totals.cached_fallbacks + totals.cold_fallbacks ||
+        totals.read_ops != totals.prefix_reads + totals.fallbacks ||
+        totals.dependent_reads != totals.fallbacks ||
+        totals.wasted != totals.rounding_waste_bytes + totals.drift_waste_bytes +
+                   totals.cold_prefix_waste_bytes)
+      throw std::runtime_error("quantized_prefix: metric identity violated");
+    }
     if (o.policy == rh::ReadPolicy::CachedLength) {
       // docs/baseline3-plan.md section 7.4.  Identities (4)-(7) assume no
       // failed transport read, which is always the case in a healthy run.

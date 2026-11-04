@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# RDMA sweep for Baseline 1/2/3 on a 10K HNSW index.
+# RDMA sweep for Baseline 1/2/3 and the quantized-prefix strategy on a 10K
+# HNSW index.
 #
 # Phases (all against the same index unless overridden):
-#   1. static     : REPS x 3 strategies, 1000 queries, one long-lived server.
-#   2. concurrency: REPS x 3 strategies x CLIENTS concurrent clients, 500
+#   1. static     : REPS x 4 strategies, 1000 queries, one long-lived server.
+#   2. concurrency: REPS x 4 strategies x CLIENTS concurrent clients, 500
 #                   queries per client, aggregate throughput.
-#   3. mixed      : REPS x 3 strategies x {erase,upsert} x ratios, with a
+#   3. mixed      : REPS x 4 strategies x {erase,upsert} x ratios, with a
 #                   private index copy and a fresh server per run.
 #
-# Every mixed run starts from an identical index copy, so the three strategies
+# Every mixed run starts from an identical index copy, so the four strategies
 # see exactly the same update stream and the same initial state.
 #
 # Environment overrides (defaults in parentheses):
@@ -17,8 +18,9 @@
 #   RDMA_HOST        control-plane host (127.0.0.1)
 #   RDMA_BIND        storage listen address (127.0.0.1)
 #   IB_DEVICE/IB_PORT/RDMA_HOST/RDMA_BIND/PORT
-#   STRATEGIES       baseline1 header_actual cached_length
+#   STRATEGIES       baseline1 header_actual cached_length prefix
 #   CACHE_CAPACITY   10000
+#   PREFIX_GRANULARITY 4
 #   REPS             3
 #   STATIC_QUERIES   1000
 #   MIXED_QUERIES    500
@@ -31,6 +33,7 @@
 #
 # Examples:
 #   scripts/run_rdma_baselines.sh
+#   STRATEGIES=prefix REPS=1 PHASES=static scripts/run_rdma_baselines.sh
 #   PHASES=static REPS=1 STATIC_QUERIES=100 scripts/run_rdma_baselines.sh
 set -euo pipefail
 
@@ -47,8 +50,9 @@ HOST="${RDMA_HOST:-127.0.0.1}"
 BIND="${RDMA_BIND:-127.0.0.1}"
 PORT="${PORT:-18515}"
 
-STRATEGIES="${STRATEGIES:-baseline1 header_actual cached_length}"
+STRATEGIES="${STRATEGIES:-baseline1 header_actual cached_length prefix}"
 CACHE_CAPACITY="${CACHE_CAPACITY:-10000}"
+PREFIX_GRANULARITY="${PREFIX_GRANULARITY:-4}"
 REPS="${REPS:-3}"
 STATIC_QUERIES="${STATIC_QUERIES:-1000}"
 MIXED_QUERIES="${MIXED_QUERIES:-500}"
@@ -92,6 +96,7 @@ strategy_key() {
     baseline1|fixed) echo "baseline1" ;;
     header_actual|header) echo "baseline2" ;;
     cached_length|cached) echo "baseline3" ;;
+    prefix) echo "prefix" ;;
     *) echo "$1" ;;
   esac
 }
@@ -101,6 +106,7 @@ canonical_strategy() {
     baseline1|fixed) echo "baseline1_fixed" ;;
     header_actual|header) echo "baseline2_header_first" ;;
     cached_length|cached) echo "baseline3_cached_length" ;;
+    prefix) echo "quantized_prefix" ;;
     *) echo "$1" ;;
   esac
 }
@@ -145,7 +151,9 @@ run_driver() {
   "${build}/baseline1_experiment" --transport rdma --host "${HOST}" \
     --port "${PORT}" --ib-device "${IB_DEVICE}" --ib-port "${IB_PORT}" \
     --rdma-connection ib --read-strategy "${strategy}" \
-    --cache-capacity "${CACHE_CAPACITY}" --ef-search "${EFS}" --k "${K}" \
+    --cache-capacity "${CACHE_CAPACITY}" \
+    --prefix-granularity "${PREFIX_GRANULARITY}" \
+    --ef-search "${EFS}" --k "${K}" \
     --ef-construction "${EFC}" --seed "${SEED}" --warmup "${WARMUP}" \
     --dataset "${DATASET}" --label "${label}" \
     --out "${per_query}" --summary-out "${summary}" "$@"
@@ -153,11 +161,14 @@ run_driver() {
 
 rotate_order() {
   local rep="$1"
-  case $(( (rep - 1) % 3 )) in
-    0) echo "baseline1 header_actual cached_length" ;;
-    1) echo "cached_length header_actual baseline1" ;;
-    *) echo "header_actual baseline1 cached_length" ;;
-  esac
+  local -a items
+  read -r -a items <<<"${STRATEGIES}"
+  local count=${#items[@]}
+  local shift=$(( (rep - 1) % count ))
+  local i
+  for ((i = 0; i < count; ++i)); do
+    echo "${items[$(((i + shift) % count))]}"
+  done
 }
 
 run_static() {

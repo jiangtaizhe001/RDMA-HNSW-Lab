@@ -3,6 +3,8 @@
 #include "rdma_hnsw/transport/transport.h"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <unordered_map>
@@ -50,6 +52,27 @@ struct ReadMetrics {
   std::uint64_t over_read_slots_sum{}; // sum of (hint - degree) over hits
   std::vector<std::uint64_t> cache_hits_by_level;   // per-level hit counts (H1)
   std::vector<std::uint64_t> cache_misses_by_level; // per-level miss counts
+  std::uint64_t layer_attempts{};
+  std::uint64_t successful_reads{};
+  std::uint64_t received_bytes{};
+  std::uint64_t cached_fallbacks{};
+  std::uint64_t cold_fallbacks{};
+  std::uint64_t cached_fallback_bytes{};
+  std::uint64_t cold_fallback_bytes{};
+  std::uint64_t first_slots_sum{};
+  std::uint64_t rounding_waste_bytes{};
+  std::uint64_t drift_waste_bytes{};
+  std::uint64_t cold_prefix_waste_bytes{};
+  std::uint64_t level_updates{};
+  std::uint64_t level_up{};
+  std::uint64_t level_down{};
+  std::uint64_t malformed_degrees{};
+  std::uint64_t prefix_failures{};
+  std::uint64_t tail_failures{};
+  std::vector<std::uint64_t> level_updates_by_level;
+  std::vector<std::uint64_t> level_up_by_level;
+  std::vector<std::uint64_t> level_down_by_level;
+  std::vector<std::uint64_t> cache_evictions_by_level;
   void merge(const ReadMetrics &o);
 };
 
@@ -75,6 +98,8 @@ struct ReadContext {
   std::size_t prefix_granularity{4};
   std::size_t cache_capacity{100000};
   std::unordered_map<NodeId, std::pair<Generation, std::uint32_t>> length_cache;
+  std::function<bool(NodeId)> valid_neighbor;
+  Offset region_bytes{std::numeric_limits<Offset>::max()};
 };
 
 class NeighborReadStrategy {
@@ -164,6 +189,31 @@ private:
 
   std::size_t capacity_{};
   SharedLengthCache cache_;
+};
+
+struct PrefixCacheEntry {
+  std::size_t level_hint{};
+  std::uint32_t last_degree{};
+  LruList::iterator lru_pos{};
+};
+
+struct PrefixCache {
+  std::unordered_map<std::uint64_t, PrefixCacheEntry> entries;
+  LruList lru;
+  std::size_t granularity{};
+};
+
+using SharedPrefixCache = std::shared_ptr<PrefixCache>;
+
+class QuantizedPrefixStrategy final : public NeighborReadStrategy {
+public:
+  explicit QuantizedPrefixStrategy(SharedPrefixCache cache = {});
+  NeighborReadResult read(const RemoteNodeView &, ReadContext &) override;
+  const char *name() const override { return "quantized_prefix"; }
+  const SharedPrefixCache &cache() const { return cache_; }
+
+private:
+  SharedPrefixCache cache_;
 };
 
 std::unique_ptr<NeighborReadStrategy> make_read_strategy(ReadPolicy policy);

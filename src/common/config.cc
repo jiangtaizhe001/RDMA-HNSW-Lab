@@ -125,6 +125,8 @@ Config parse_config(int argc, char **argv, const std::string &mode) {
     throw std::invalid_argument("missing --index");
   if (c.port == 0 || c.port > 65535 || c.rdma_timeout_ms == 0 || c.rdma_timeout_ms > 600000)
     throw std::invalid_argument("port must be 1..65535; rdma-timeout-ms must be 1..600000");
+  if (!c.prefix_granularity)
+    throw std::invalid_argument("prefix granularity must be positive");
   if (c.M < 2 || c.k == 0 || c.ef_search < c.k || c.ib_port == 0 ||
       c.ib_port > 255)
     throw std::invalid_argument("invalid M/k/ef-search/ib-port");
@@ -146,16 +148,15 @@ void print_usage(const std::string &mode) {
       << "  --transport mmap|rdma                 transport backend\n"
       << "  --rdma-connection ib|cm               IB LID (default) or RDMA CM (eRDMA)\n"
       << "  --rdma-timeout-ms N                   CM handshake/operation deadline (10000)\n"
-      << "  --read-strategy fixed|header_actual|cached_length  built-in "
+      << "  --read-strategy fixed|header_actual|cached_length|prefix  built-in "
          "strategies: fixed (read full fixed-capacity neighbour slots), "
          "header_actual (read the degree word first, then the actual "
          "neighbours), cached_length (predict the degree from a compute-side "
-         "cache and read degree+prefix in one operation); other names are "
-         "reserved for custom strategies injected through the API\n"
+         "cache), prefix (quantized degree+prefix, at most one tail read)\n"
       << "  --cache-capacity N                    length-cache entries "
-         "(default 100000; cached_length only)\n"
+         "(default 100000; cached_length and prefix; 0 disables caching)\n"
       << "  --prefix-granularity N                prefix granularity G "
-         "(default 4; reserved for the prefix strategy)\n"
+         "(positive, default 4)\n"
       << "  --M N --ef-construction N --ef-search N --k N\n"
       << "  --queries FILE --updates FILE\n"
       << "  --base FILE                             vectors for exact recall\n"
