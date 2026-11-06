@@ -56,13 +56,28 @@ for n in ${SIZES//,/ }; do
   if [[ -n "${SIFT_DIR}" ]]; then
     base="${SIFT_DIR}/sift_base_${n}.fvecs"
     [[ -f "${base}" ]] || { echo "[baseline1] missing ${base}" >&2; exit 1; }
-    idx="${data}/${TAG}_n${n}_d${DIM}.bin"
+    query_file="${SIFT_DIR}/sift_query.fvecs"
+    gt_file="${SIFT_DIR}/sift_gt_${n}_k${K}.bin"
+    if [[ -f "${gt_file}" && ! -f "${query_file}" ]]; then
+      echo "[baseline1] ground truth requires matching queries: ${query_file}" >&2
+      exit 1
+    fi
+    base_hash="$(sha256sum -- "${base}")"
+    base_hash="${base_hash%% *}"
+    mkdir -p "${data}/recall_indexes"
+    idx="${data}/recall_indexes/base_${base_hash}_n${n}_d${DIM}_M${M}_efc${EFC}_seed${SEED}.bin"
     if [[ ! -f "${idx}" ]]; then
       "${build}/hnsw_build" --input "${base}" --dim "${DIM}" --M "${M}" \
-        --ef-construction "${EFC}" --output "${idx}"
+        --ef-construction "${EFC}" --seed "${SEED}" --output "${idx}"
     fi
     gt_file="${SIFT_DIR}/sift_gt_${n}_k${K}.bin"
-    [[ -f "${gt_file}" ]] && gt_extra=(--gt "${gt_file}")
+    # Without an offline ground truth, fall back to exact recall against the
+    # base vectors: the index is built from this file, so row order == node id.
+    if [[ -f "${gt_file}" ]]; then
+      gt_extra=(--gt "${gt_file}")
+    else
+      gt_extra=(--base "${base}")
+    fi
     query_extra=()
     [[ -f "${SIFT_DIR}/sift_query.fvecs" ]] && query_extra=(--queries "${SIFT_DIR}/sift_query.fvecs")
   else

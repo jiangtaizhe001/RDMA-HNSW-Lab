@@ -26,6 +26,11 @@
 #   DISTS     update distributions          (default roundrobin hot)
 #   HOT_SIZE  hot-set size for 'hot'        (default driver: node_count/100)
 #   QUERIES UPDATES WARMUP EFS K EFC SEED DATASET
+#   RECALL_DIR  optional directory with <prefix>_base_<n>.fvecs and, optionally,
+#               <prefix>_query.fvecs / <prefix>_gt_<n>_k<k>.bin.  When set, the
+#               index is built from the base file (so neighbour ids match the
+#               ground-truth ids) and recall is actually measured.
+#   RECALL_PREFIX  file name prefix inside RECALL_DIR (default sift)
 #   OUT_DIR   output directory              (default <root>/out)
 #   RESET_SUMMARY=0 to append instead of truncating the summary CSV
 #   SKIP_B1B2=1 to only run Baseline 3 (rows then have no B1/B2 partner)
@@ -56,6 +61,9 @@ UPDATES="${UPDATES:-500}"
 WARMUP="${WARMUP:-50}"
 SEED="${SEED:-42}"
 DATASET="${DATASET:-synthetic}"
+RECALL_DIR="${RECALL_DIR:-}"
+RECALL_PREFIX="${RECALL_PREFIX:-sift}"
+recall_args=()
 SUMMARY="${out}/baseline3_summary.csv"
 RESET_SUMMARY="${RESET_SUMMARY:-1}"
 SKIP_B1B2="${SKIP_B1B2:-0}"
@@ -86,7 +94,7 @@ run() {
     --label "${label}" --ef-construction "${EFC}" \
     --read-strategy "${strat}" \
     --out "${out}/baseline3_${label}_${strat}${suffix}.csv" \
-    --summary-out "${SUMMARY}" "$@"
+    --summary-out "${SUMMARY}" "${recall_args[@]}" "$@"
 }
 
 for cfg in ${CONFIGS}; do
@@ -94,8 +102,35 @@ for cfg in ${CONFIGS}; do
   rest="${cfg#*:}"
   dim="${rest%%:*}"
   M="${rest##*:}"
+  recall_args=()
   idx="${data}/index_n${n}_d${dim}_M${M}.bin"
-  if [[ ! -f "${idx}" ]]; then
+  if [[ -n "${RECALL_DIR}" ]]; then
+    base="${RECALL_DIR}/${RECALL_PREFIX}_base_${n}.fvecs"
+    [[ -f "${base}" ]] || { echo "[baseline3] missing ${base}" >&2; exit 1; }
+    gt="${RECALL_DIR}/${RECALL_PREFIX}_gt_${n}_k${K}.bin"
+    query_file="${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs"
+    if [[ -f "${gt}" && ! -f "${query_file}" ]]; then
+      echo "[baseline3] ground truth requires matching queries: ${query_file}" >&2
+      exit 1
+    fi
+    if [[ -f "${gt}" ]]; then
+      recall_args=(--gt "${gt}")
+    else
+      recall_args=(--base "${base}")
+    fi
+    [[ -f "${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs" ]] && \
+      recall_args+=(--queries "${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs")
+    # Build from the recall base so neighbour ids equal ground-truth rows.
+    base_hash="$(sha256sum -- "${base}")"
+    base_hash="${base_hash%% *}"
+    mkdir -p "${data}/recall_indexes"
+    idx="${data}/recall_indexes/base_${base_hash}_n${n}_d${dim}_M${M}_efc${EFC}_seed${SEED}.bin"
+    if [[ ! -f "${idx}" ]]; then
+      echo "[baseline3] building ${idx} from ${base}"
+      "${build}/hnsw_build" --input "${base}" --dim "${dim}" --M "${M}" \
+        --ef-construction "${EFC}" --seed "${SEED}" --output "${idx}"
+    fi
+  elif [[ ! -f "${idx}" ]]; then
     echo "[baseline3] building ${idx}"
     "${build}/hnsw_build" --generate "${n}" --dim "${dim}" --M "${M}" \
       --ef-construction "${EFC}" --seed "${SEED}" --output "${idx}"
@@ -115,6 +150,9 @@ for cfg in ${CONFIGS}; do
     run cached_length "${idx}" "${label}" "_c${cap}" --cache-capacity "${cap}"
   done
 
+  # Mixed workloads mutate the index, so the static ground truth no longer
+  # describes the current data; leave recall unmeasured there (as Baseline 1).
+  recall_args=()
   # ---- mixed workloads --------------------------------------------------
   for op in erase upsert; do
     for r in ${RATIOS//,/ }; do

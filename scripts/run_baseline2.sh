@@ -18,6 +18,11 @@
 #            (default: 10000:128:16 100000:128:16 10000:32:16 10000:128:8 10000:128:32)
 #   RATIOS   update ratios                   (default 0.1,0.3,0.5)
 #   QUERIES UPDATES WARMUP EFS K EFC SEED
+#   RECALL_DIR  optional directory with <prefix>_base_<n>.fvecs and, optionally,
+#               <prefix>_query.fvecs / <prefix>_gt_<n>_k<k>.bin.  When set, the
+#               index is built from the base file (so neighbour ids match the
+#               ground-truth ids) and recall is actually measured.
+#   RECALL_PREFIX  file name prefix inside RECALL_DIR (default sift)
 #   OUT_DIR  output directory                (default <root>/out)
 #   RESET_SUMMARY=0 to append instead of truncating the summary CSV
 #
@@ -42,6 +47,9 @@ UPDATES="${UPDATES:-500}"
 WARMUP="${WARMUP:-50}"
 SEED="${SEED:-42}"
 DATASET="${DATASET:-synthetic}"
+RECALL_DIR="${RECALL_DIR:-}"
+RECALL_PREFIX="${RECALL_PREFIX:-sift}"
+recall_args=()
 SUMMARY="${out}/baseline2_summary.csv"
 RESET_SUMMARY="${RESET_SUMMARY:-1}"
 
@@ -65,7 +73,7 @@ run() {
     --label "${label}" --ef-construction "${EFC}" \
     --read-strategy "${strat}" \
     --out "${out}/baseline2_${label}_${strat}.csv" \
-    --summary-out "${SUMMARY}" "$@"
+    --summary-out "${SUMMARY}" "${recall_args[@]}" "$@"
 }
 
 for cfg in ${CONFIGS}; do
@@ -73,18 +81,50 @@ for cfg in ${CONFIGS}; do
   rest="${cfg#*:}"
   dim="${rest%%:*}"
   M="${rest##*:}"
+  recall_args=()
   idx="${data}/index_n${n}_d${dim}_M${M}.bin"
-  if [[ ! -f "${idx}" ]]; then
+  if [[ -n "${RECALL_DIR}" ]]; then
+    base="${RECALL_DIR}/${RECALL_PREFIX}_base_${n}.fvecs"
+    [[ -f "${base}" ]] || { echo "[baseline2] missing ${base}" >&2; exit 1; }
+    gt="${RECALL_DIR}/${RECALL_PREFIX}_gt_${n}_k${K}.bin"
+    query_file="${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs"
+    if [[ -f "${gt}" && ! -f "${query_file}" ]]; then
+      echo "[baseline2] ground truth requires matching queries: ${query_file}" >&2
+      exit 1
+    fi
+    if [[ -f "${gt}" ]]; then
+      recall_args=(--gt "${gt}")
+    else
+      recall_args=(--base "${base}")
+    fi
+    [[ -f "${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs" ]] && \
+      recall_args+=(--queries "${RECALL_DIR}/${RECALL_PREFIX}_query.fvecs")
+    # Build from the recall base so neighbour ids equal ground-truth rows.
+    base_hash="$(sha256sum -- "${base}")"
+    base_hash="${base_hash%% *}"
+    mkdir -p "${data}/recall_indexes"
+    idx="${data}/recall_indexes/base_${base_hash}_n${n}_d${dim}_M${M}_efc${EFC}_seed${SEED}.bin"
+    if [[ ! -f "${idx}" ]]; then
+      echo "[baseline2] building ${idx} from ${base}"
+      "${build}/hnsw_build" --input "${base}" --dim "${dim}" --M "${M}" \
+        --ef-construction "${EFC}" --seed "${SEED}" --output "${idx}"
+    fi
+  elif [[ ! -f "${idx}" ]]; then
     echo "[baseline2] building ${idx}"
     "${build}/hnsw_build" --generate "${n}" --dim "${dim}" --M "${M}" \
       --ef-construction "${EFC}" --seed "${SEED}" --output "${idx}"
   fi
   tag="n${n}_d${dim}_M${M}"
 
+  static_recall_args=("${recall_args[@]}")
   for strat in baseline1 header_actual; do
     echo "[baseline2] ${tag} static ${strat}"
+    recall_args=("${static_recall_args[@]}")
     run "${strat}" "${idx}" "${tag}_static"
 
+    # Mixed workloads mutate the index, so the static ground truth no longer
+    # describes the current data; leave recall unmeasured there (as Baseline 1).
+    recall_args=()
     for op in erase upsert; do
       for r in ${RATIOS//,/ }; do
         work="${data}/.b2work_${tag}_${op}_${r}.bin"
