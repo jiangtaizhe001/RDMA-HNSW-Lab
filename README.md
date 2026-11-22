@@ -4,7 +4,57 @@ RDMA-HNSW-Lab 是一个面向动态图索引研究的 HNSW 存算分离原型。
 
 项目的目标是提供一个便于二次开发的系统底座。查询调度、读取策略、并发 workload、数据集转换和实验指标由使用者自行决定
 
-科研轮转任务相关内容与要求见`docs/` 
+科研轮转任务的研究问题、实验协议与实测结论全部在 `docs/` 中，按“计划 + 报告”成对组织，详见 [文档：计划与报告](#文档计划与报告)。
+
+## 文档：计划与报告
+
+`docs/` 下的实验文档按用途分工，每轮实验都是先有**计划**（协议、比较单元、指标口径、验收门禁），后有**报告**（实测数据、置信区间、结论边界）：
+
+- `*-plan.md`：实验协议。固定数据、索引、查询顺序、预算、缓存与重复次数，并预先写明什么算达标、什么算未完成。
+- `*-report.md`：对应的实测结果。数字来自 `out/` 下的逐查询原始数据，结论按“可下 / 不可下”分开写。
+- `*-design.md`：机制设计（如分级前缀读取的桶、状态机与正确性门禁）。
+- `*-progress-*.md` / `*-repair-*.md`：执行过程与故障记录，只追加不追溯改写旧结果。
+
+| 主题 | 计划（协议） | 报告（实测） |
+| --- | --- | --- |
+| 课题背景与 baseline 定义 | [experiment.md](docs/experiment.md) | — |
+| 系统分层与指标口径 | [help.md](docs/help.md) | — |
+| Baseline 1：固定读取全部 slot | [baseline1-plan.md](docs/baseline1-plan.md) | [baseline1-report.md](docs/baseline1-report.md) |
+| Baseline 2：header-first 依赖读取 | [baseline2-plan.md](docs/baseline2-plan.md) | [baseline2-report.md](docs/baseline2-report.md) |
+| Baseline 3：长度缓存与三态读取 | [baseline3-plan.md](docs/baseline3-plan.md) | [baseline3-report.md](docs/baseline3-report.md) |
+| 三个 baseline 的真实 IB 10K 计时 | — | [rdma-baseline-report.md](docs/rdma-baseline-report.md) |
+| 分级前缀（Quantized Prefix）机制 | [prefix-read-design.md](docs/prefix-read-design.md) | [prefix-read-report.md](docs/prefix-read-report.md) |
+| 100K RDMA 前缀粒度扫描 | [prefix-rdma-100k-plan.md](docs/prefix-rdma-100k-plan.md) | [prefix-rdma-100k-report.md](docs/prefix-rdma-100k-report.md) |
+| G=32 十种索引规模的 efsearch 阈值 | [prefix-g32-efsearch-plan.md](docs/prefix-g32-efsearch-plan.md) | [prefix-g32-efsearch-report.md](docs/prefix-g32-efsearch-report.md) |
+| **真实数据、1M RDMA、重复与并发** | **[real-data-rdma-improvement-plan.md](docs/real-data-rdma-improvement-plan.md)** | **[real-data-rdma-report.md](docs/real-data-rdma-report.md)** |
+
+### 最新一轮：真实数据、1M RDMA 与重复实验
+
+计划 [real-data-rdma-improvement-plan.md](docs/real-data-rdma-improvement-plan.md)
+定义了四个研究问题（中间粒度是否有可重复折中、100K→1M 的 READ/字节/时延变化、动态更新收益来源、客户端扩展后的吞吐与公平性），并要求 SIFT1M/GIST1M × 100K/1M × recall 0.95/0.99 × 7 配置，每格 5 次独立重复、真实 RDMA、精确 float64 真值。
+
+报告 [real-data-rdma-report.md](docs/real-data-rdma-report.md) 的结论摘要：
+
+- **M=16 时 G=32 与 B1 完全等价**：READ/query 与请求字节逐项相等，退化为固定读取。
+- **中间粒度没有稳定优势**。完整阶梯 G=1/2/4/8/16/32 上，浪费率单调上升 0 → 0.022 → 0.062 → 0.137 → 0.241 → 0.323，而 p50 只在 2367–2403 µs 间波动、均值比多在 ±1.2 % 内。
+- **1M 上“少 READ、多字节”更快**：B1/G32 比 B3 快 2–3.6 %（配对区间不含 1），代价是字节 +1.3–1.5 倍；100K 上则无差别，说明层间权衡随规模反转。
+- **B2 的依赖读取读次数翻倍**，在 SIFT 与 GIST 上稳定慢 1.3–3.6 %。
+- **并发近线性到 8 客户端**：SIFT 100K 525→3353 QPS、1M 290→1669 QPS，Jain ≥0.997，8 客户端时服务端仍未饱和。
+- **更新被整份索引重写支配**：单次更新 0.52 s（100K）/ 6.5 s（1M）；100 次更新后检查点质量不变（recall 0.9562 → 0.9560），所有读取策略结果一致。
+
+报告同时登记了不可下的结论与未完成项：受延迟双峰污染的两格不参与策略比较、混合 workload 因更新成本改为固定 100 次更新（不构成比例敏感性实验）、仅单机 IB loopback 因而不能外推跨机 RTT。执行过程见 [real-data-rdma-progress-2026-11-16.md](docs/real-data-rdma-progress-2026-11-16.md)，故障与根因见 [real-data-rdma-repair-2026-11-12.md](docs/real-data-rdma-repair-2026-11-12.md)。
+
+结果与数据的落盘位置：
+
+```text
+data/real/{sift,gist}/            子集向量、索引、精确 GT、查询划分、更新日志、检查点 GT
+out/real_data_rdma/<campaign>/    每轮命令/日志/summary/per_query + analysis/（表格与置信区间）
+out/real_data_rdma/summary_all.md 跨活动汇总（脚本生成，不手抄数字）
+```
+
+这两个目录已列入 `.gitignore`（体积与可再生产物），报告中的每个数字都可用 `scripts/` 下的脚本对它们复算。
+
+复现入口：`scripts/run_real_data_pipeline.sh`（数据准备与静态矩阵）、`scripts/run_real_data_pipeline2.sh`（预算 top-up、混合/并发/检查点、构图种子与扩展扫描）；`scripts/analyze_real_rdma.py` 生成单个活动的 `analysis/`，`scripts/summarize_real_rdma_campaigns.py` 生成跨活动汇总。两个流水线都是标记驱动、可中断续跑的。
 
 ## 项目组成
 
@@ -13,7 +63,7 @@ include/rdma_hnsw/       公开 C++ 头文件
 src/                     库实现和命令行程序
 tests/                   单元测试
 example/                 独立 API 使用示例
-docs/                    实验说明
+docs/                    实验计划与报告（plan / report 成对）及部署说明
 third_party/hnswlib/     vendored hnswlib 头文件
 ```
 
