@@ -29,7 +29,10 @@ IndexCatalog read_remote_catalog(RemoteTransport &transport) {
                                catalog.offsets.size() * sizeof(Offset));
   const auto orr = transport.read({header.offsets_begin, 0}, bytes);
   if (!orr.ok || orr.bytes != bytes.size())
-    throw std::runtime_error("cannot read remote index offset table");
+    throw std::runtime_error(
+        "cannot read remote index offset table: " + orr.error + " (read " +
+        std::to_string(orr.bytes) + " of " + std::to_string(bytes.size()) +
+        " bytes)");
   return catalog;
 }
 } // namespace

@@ -31,11 +31,14 @@ constexpr std::uint32_t kUpdateMagic = 0x52485550; // RHUP
 
 // The TCP bootstrap is deliberately small and versionless for this teaching
 // prototype. Both endpoints run the same binary and therefore share layout.
+// `size` is 64-bit because a 960-dimensional 1M-node index exceeds 4 GiB; a
+// 32-bit field silently truncated it and made every read past the truncated
+// bound fail at connect time.
 struct WireInfo {
   std::uint32_t qp_num{};
   std::uint32_t psn{};
   std::uint32_t rkey{};
-  std::uint32_t size{};
+  std::uint64_t size{};
   std::uint16_t lid{};
   std::uint16_t port{};
   std::uint64_t addr{};
@@ -296,7 +299,7 @@ public:
         resources_.qp()->qp_num,
         resources_.psn(),
         resources_.mr()->rkey,
-        static_cast<std::uint32_t>(resources_.buffer.size()),
+        static_cast<std::uint64_t>(resources_.buffer.size()),
         resources_.lid(),
         resources_.port(),
         reinterpret_cast<std::uint64_t>(resources_.buffer.data())};
@@ -313,32 +316,42 @@ public:
   ReadResult read(RemoteAddress address, std::span<byte> destination) override {
     if (destination.empty())
       return {true, 0, {}};
-    if (destination.size() > resources_.buffer.size())
-      return {false, 0, "RDMA read exceeds local staging buffer"};
     if (address.offset > remote_.size ||
         destination.size() > remote_.size - address.offset)
       return {false, 0, "RDMA read exceeds remote registered buffer"};
 
     std::lock_guard lock(mutex_);
-    ibv_sge sge{reinterpret_cast<std::uintptr_t>(resources_.buffer.data()),
-                static_cast<std::uint32_t>(destination.size()),
-                resources_.mr()->lkey};
-    ibv_send_wr work_request{}, *bad_request = nullptr;
-    work_request.wr_id = 1;
-    work_request.sg_list = &sge;
-    work_request.num_sge = 1;
-    work_request.opcode = IBV_WR_RDMA_READ;
-    work_request.send_flags = IBV_SEND_SIGNALED;
-    work_request.wr.rdma.remote_addr = remote_.addr + address.offset;
-    work_request.wr.rdma.rkey = remote_.rkey;
-    if (ibv_post_send(resources_.qp(), &work_request, &bad_request) != 0)
-      return {false, 0, "ibv_post_send RDMA READ failed"};
-    wait_for_completion(resources_);
-    std::memcpy(destination.data(), resources_.buffer.data(),
-                destination.size());
-    stats_.read_ops.fetch_add(1);
-    stats_.read_bytes.fetch_add(destination.size());
-    stats_.rtt.fetch_add(1);
+    // The staging buffer is 1 MiB, so reads larger than that (for example the
+    // 8 MiB offset table of a 1M-node index) have to be split. The RDMA-CM
+    // transport already chunks the same way; doing it here keeps the IB LID
+    // backend usable at million scale instead of failing at connect time.
+    std::size_t done = 0;
+    while (done < destination.size()) {
+      const auto chunk = std::min(kStagingBytes, destination.size() - done);
+      ibv_sge sge{reinterpret_cast<std::uintptr_t>(resources_.buffer.data()),
+                  static_cast<std::uint32_t>(chunk), resources_.mr()->lkey};
+      ibv_send_wr work_request{}, *bad_request = nullptr;
+      work_request.wr_id = 1;
+      work_request.sg_list = &sge;
+      work_request.num_sge = 1;
+      work_request.opcode = IBV_WR_RDMA_READ;
+      work_request.send_flags = IBV_SEND_SIGNALED;
+      work_request.wr.rdma.remote_addr =
+          remote_.addr + address.offset + done;
+      work_request.wr.rdma.rkey = remote_.rkey;
+      if (ibv_post_send(resources_.qp(), &work_request, &bad_request) != 0)
+        return {false, done, "ibv_post_send RDMA READ failed"};
+      try {
+        wait_for_completion(resources_);
+      } catch (const std::exception &error) {
+        return {false, done, error.what()};
+      }
+      std::memcpy(destination.data() + done, resources_.buffer.data(), chunk);
+      stats_.read_ops.fetch_add(1);
+      stats_.read_bytes.fetch_add(chunk);
+      stats_.rtt.fetch_add(1);
+      done += chunk;
+    }
     return {true, destination.size(), {}};
   }
 
@@ -447,7 +460,7 @@ void serve_rdma_session(int socket, const std::string &index_path,
       resources.qp()->qp_num,
       resources.psn(),
       resources.mr()->rkey,
-      static_cast<std::uint32_t>(resources.buffer.size()),
+      static_cast<std::uint64_t>(resources.buffer.size()),
       resources.lid(),
       resources.port(),
       reinterpret_cast<std::uint64_t>(resources.buffer.data())};
